@@ -1,0 +1,315 @@
+﻿#if UNITY_EDITOR
+// EditorLanguageManager.cs
+// 单例 + 多语言文本管理（Chinese / Japanese / English）
+// 用途：被编辑器工具与“关于作者”窗口统一调用
+
+using System.Collections.Generic;
+using UnityEditor;
+using UnityEngine;
+
+public enum EditorLanguage
+{
+    Chinese = 0,
+    Japanese = 1,
+    English = 2
+}
+
+public sealed class EditorLanguageManager
+{
+    private static EditorLanguageManager _instance;
+    public static EditorLanguageManager Instance => _instance ?? (_instance = new EditorLanguageManager());
+
+    // [LGC 修改] 当前语言，默认中文
+    public EditorLanguage CurrentLang = EditorLanguage.Chinese;
+
+    // 三语词库
+    private readonly Dictionary<string, string> _zh = new Dictionary<string, string>();
+    private readonly Dictionary<string, string> _ja = new Dictionary<string, string>();
+    private readonly Dictionary<string, string> _en = new Dictionary<string, string>();
+
+    private bool _inited = false;
+
+    private EditorLanguageManager() { }
+
+    // [LGC 修改] 初始化所有 UI / 文案键值
+    public void InitLanguageData()
+    {
+        if (_inited) return;
+        _inited = true;
+
+        // ---- 通用 / 工具名 / 底部提示 ----
+        _zh["ToolDisplayName"] = "LGC网格UV绘画工具";
+        _ja["ToolDisplayName"] = "LGCメッシュUVペイントツール";
+        _en["ToolDisplayName"] = "LGC Mesh UV Painter";
+
+        _zh["ClickToSeeMore"] = "点击查看详细信息";
+        _ja["ClickToSeeMore"] = "詳細情報を見るにはクリック";
+        _en["ClickToSeeMore"] = "Click to see more details";
+
+        _zh["BottomAuthorInfo"] = "作者: copilote + LGC";
+        _ja["BottomAuthorInfo"] = "作者: copilote + LGC";
+        _en["BottomAuthorInfo"] = "Author: copilote + LGC";
+
+        _zh["BottomVersionInfo"] = "版本: {0}";
+        _ja["BottomVersionInfo"] = "バージョン: {0}";
+        _en["BottomVersionInfo"] = "Version: {0}";
+
+        // ---- 面板结构 ----
+        _zh["LeftPanelTitle"] = "工具区";
+        _ja["LeftPanelTitle"] = "ツールエリア";
+        _en["LeftPanelTitle"] = "Tools";
+
+        _zh["RightPanelTitle"] = "绘制区";
+        _ja["RightPanelTitle"] = "ペイントエリア";
+        _en["RightPanelTitle"] = "Canvas";
+
+        // ---- 顶部语言切换 ----
+        _zh["LangDropdownTooltip"] = "切换界面语言";
+        _ja["LangDropdownTooltip"] = "UI言語を切り替え";
+        _en["LangDropdownTooltip"] = "Switch UI language";
+
+        // ---- 目标对象 / 材质槽 ----
+        _zh["TargetObject"] = "网格对象";
+        _ja["TargetObject"] = "メッシュオブジェクト";
+        _en["TargetObject"] = "Mesh Object";
+
+        _zh["MatSlot"] = "材质槽";
+        _ja["MatSlot"] = "マテリアルスロット";
+        _en["MatSlot"] = "Material Slot";
+
+        _zh["MatSlotNone"] = "（无）";
+        _ja["MatSlotNone"] = "（なし）";
+        _en["MatSlotNone"] = "(None)";
+
+        _zh["RefreshSlot"] = "刷新/重新读取当前槽";
+        _ja["RefreshSlot"] = "リフレッシュ/再読み込み";
+        _en["RefreshSlot"] = "Refresh / Reload Slot";
+
+        _zh["MaterialInfoFold"] = "材质信息";
+        _ja["MaterialInfoFold"] = "マテリアル情報";
+        _en["MaterialInfoFold"] = "Material Info ";
+
+        _zh["MatCurrent"] = "当前材质";
+        _ja["MatCurrent"] = "現在のマテリアル";
+        _en["MatCurrent"] = "Current Material";
+
+        _zh["MatOriginalAsset"] = "原始材质资产";
+        _ja["MatOriginalAsset"] = "元のマテリアルアセット";
+        _en["MatOriginalAsset"] = "Original Material Asset";
+
+        _zh["MainTexProp"] = "主纹理属性";
+        _ja["MainTexProp"] = "メインテクスチャプロパティ";
+        _en["MainTexProp"] = "Main Texture Property";
+
+        _zh["MainTexOriginal"] = "原始主色图";
+        _ja["MainTexOriginal"] = "元のメインテクスチャ";
+        _en["MainTexOriginal"] = "Original Main Texture";
+
+        _zh["OutputPng"] = "输出 PNG";
+        _ja["OutputPng"] = "出力 PNG";
+        _en["OutputPng"] = "Output PNG";
+
+        _zh["PaintCopy"] = "绘制副本";
+        _ja["PaintCopy"] = "ペイントコピー";
+        _en["PaintCopy"] = "Paint Copy";
+
+        // ---- 模式 ----
+        _zh["ModeTitle"] = "模式";
+        _ja["ModeTitle"] = "モード";
+        _en["ModeTitle"] = "Modes ";
+
+        _zh["ModeBrush"] = " 画笔模式";
+        _ja["ModeBrush"] = " ブラシモード";
+        _en["ModeBrush"] = " Brush Mode";
+
+        _zh["ModeErase"] = " 橡皮擦模式";
+        _ja["ModeErase"] = " 消しゴムモード";
+        _en["ModeErase"] = " Eraser Mode ";
+
+        _zh["ModeFill"] = " 孤岛填充模式（UV）";
+        _ja["ModeFill"] = " アイランド塗りつぶし（UV）";
+        _en["ModeFill"] = " UV Island Fill";
+
+        // ---- 预览与叠加 / 画笔 ----
+        _zh["PreviewOverlayTitle"] = "预览与叠加";
+        _ja["PreviewOverlayTitle"] = "プレビューとオーバーレイ";
+        _en["PreviewOverlayTitle"] = "Preview & Overlay";
+
+        _zh["ShowUVOverlay"] = "显示UV叠加";
+        _ja["ShowUVOverlay"] = "UVオーバーレイを表示";
+        _en["ShowUVOverlay"] = "Show UV Overlay ";
+
+        _zh["UVLineColor"] = "UV线颜色";
+        _ja["UVLineColor"] = "UVライン色";
+        _en["UVLineColor"] = "UV Line Color";
+
+        _zh["UVOverlayStrength"] = "UV叠加强度";
+        _ja["UVOverlayStrength"] = "UVオーバーレイ強度";
+        _en["UVOverlayStrength"] = "UV Overlay Strength";
+
+        _zh["BrushAndFill"] = "画笔与填充";
+        _ja["BrushAndFill"] = "ブラシと塗りつぶし";
+        _en["BrushAndFill"] = "Brush & Fill";
+
+        _zh["BrushOrFillColor"] = "画笔/填充颜色";
+        _ja["BrushOrFillColor"] = "ブラシ/塗りつぶし色";
+        _en["BrushOrFillColor"] = "Brush/Fill Color";
+
+        _zh["BrushRadius"] = "画笔半径（像素）";
+        _ja["BrushRadius"] = "ブラシ半径（px）";
+        _en["BrushRadius"] = "Brush Radius (px)";
+
+        _zh["Opacity"] = "不透明度";
+        _ja["Opacity"] = "不透明度";
+        _en["Opacity"] = "Opacity";
+
+        _zh["Hardness"] = "硬度（边缘）";
+        _ja["Hardness"] = "硬さ（エッジ）";
+        _en["Hardness"] = "Hardness (Edge)";
+
+        // ---- 绘制区顶部按钮 ----
+        _zh["ResetViewBtn"] = "重置视图";
+        _ja["ResetViewBtn"] = "ビューをリセット";
+        _en["ResetViewBtn"] = "Reset View";
+
+        // ---- 实时预览 / 保存 / 清空 / 定位 ----
+        _zh["GroupApplySaveLocate"] = "实时预览 / 保存 / 清空 / 定位";
+        _ja["GroupApplySaveLocate"] = "リアルタイム表示 / 保存 / クリア / 移動";
+        _en["GroupApplySaveLocate"] = "Realtime / Save / Clear / Locate";
+
+        _zh["RealtimePreviewToggle"] = "实时预览效果";
+        _ja["RealtimePreviewToggle"] = "リアルタイム表示";
+        _en["RealtimePreviewToggle"] = "Realtime Preview";
+
+        _zh["SaveOutputFull"] = "输出贴图保存（完整贴图导出）";
+        _ja["SaveOutputFull"] = "テクスチャ出力（フル画像）";
+        _en["SaveOutputFull"] = "Save Output (Full Texture)";
+
+        _zh["ExportPaintLayer"] = "仅输出绘画层（透明底）";
+        _ja["ExportPaintLayer"] = "描画レイヤのみ出力（透明）";
+        _en["ExportPaintLayer"] = "Export Paint Layer (Alpha)";
+
+        _zh["ClearEdits"] = "清空本次修改";
+        _ja["ClearEdits"] = "今回の編集をクリア";
+        _en["ClearEdits"] = "Clear Edits";
+
+        _zh["ConfirmClearEdits"] = "再次点击，确认清空";
+        _ja["ConfirmClearEdits"] = "もう一度クリックで確定";
+        _en["ConfirmClearEdits"] = "Click again to confirm";
+
+        // ---- 定位按钮（简化文本） ----
+        _zh["LocateProjectResBtn"] = "定位到 Project 面板资源";
+        _ja["LocateProjectResBtn"] = "プロジェクトパネルリソースに移動";
+        _en["LocateProjectResBtn"] = "Locate Project Panel Resource";
+
+        // ---- 信息/提示 ----
+        _zh["InfoWelcome"] = "拖入模型后会将主色图复制到输出目录（PNG），在右侧进行绘制。保存按钮仅写文件，关闭窗口自动还原材质。";
+        _ja["InfoWelcome"] = "モデルをドラッグするとメインテクスチャをPNGに複製し、右側で編集できます。保存はファイルのみ、ウィンドウを閉じるとマテリアルは復元されます。";
+        _en["InfoWelcome"] = "Drag a model to copy its main texture to PNG, then paint on the right. Save only writes files; material is restored on close.";
+
+        _zh["InfoNoRenderer"] = "未找到 Renderer（MeshRenderer/SkinnedMeshRenderer）。";
+        _ja["InfoNoRenderer"] = "Renderer（MeshRenderer/SkinnedMeshRenderer）が見つかりません。";
+        _en["InfoNoRenderer"] = "No Renderer (MeshRenderer/SkinnedMeshRenderer) found.";
+
+        _zh["InfoNoMesh"] = "未找到有效 Mesh。";
+        _ja["InfoNoMesh"] = "有効なメッシュが見つかりません。";
+        _en["InfoNoMesh"] = "No valid Mesh found.";
+
+        _zh["InfoNoMats"] = "未找到材质。已生成透明绘制副本。";
+        _ja["InfoNoMats"] = "マテリアルが見つかりません。透明のペイントコピーを作成しました。";
+        _en["InfoNoMats"] = "No materials found. A transparent paint copy is created.";
+
+        _zh["InfoSlotInvalid"] = "材质槽无效。";
+        _ja["InfoSlotInvalid"] = "マテリアルスロットが無効です。";
+        _en["InfoSlotInvalid"] = "Invalid material slot.";
+
+        _zh["InfoSlotEmpty"] = "材质槽 {0} 为空。";
+        _ja["InfoSlotEmpty"] = "マテリアルスロット {0} は空です。";
+        _en["InfoSlotEmpty"] = "Material slot {0} is empty.";
+
+        _zh["InfoReadMainTexOk"] = "已读取主纹理：{0}。已在输出目录生成：{1}。可绘制并【输出贴图保存】。";
+        _ja["InfoReadMainTexOk"] = "メインテクスチャ {0} を読み込みました。出力先：{1}。編集後【保存】できます。";
+        _en["InfoReadMainTexOk"] = "Main texture {0} loaded. Output created at: {1}. You can paint and then [Save].";
+
+        _zh["InfoNoMainTex"] = "不包含主纹理。已在输出目录生成空白 PNG：{0}。";
+        _ja["InfoNoMainTex"] = "メインテクスチャなし。空のPNGを作成：{0}。";
+        _en["InfoNoMainTex"] = "No main texture. Created a blank PNG at: {0}.";
+
+        _zh["WarnFillOutsideUV"] = "点击位置不在网格 UV 覆盖区域内，无法填充。";
+        _ja["WarnFillOutsideUV"] = "クリック位置はUVカバー範囲外のため塗りつぶしできません。";
+        _en["WarnFillOutsideUV"] = "Click position is outside UV coverage; cannot fill.";
+
+        _zh["RealtimeOn"] = "实时预览：已将绘制副本赋到材质（仅内存，不写入文件）。";
+        _ja["RealtimeOn"] = "リアルタイム表示：ペイントコピーをマテリアルへ（メモリのみ・ファイル未保存）。";
+        _en["RealtimeOn"] = "Realtime preview: paint copy assigned to material (memory only, not saved).";
+
+        _zh["RealtimeOff"] = "已关闭实时预览：材质还原为原始资产。";
+        _ja["RealtimeOff"] = "リアルタイム表示をオフ：マテリアルを元に戻しました。";
+        _en["RealtimeOff"] = "Realtime preview turned off: material restored.";
+
+        _zh["SaveOk"] = "已保存当前绘制为完整贴图：{0}（未修改模型/材质，仅写入文件）。";
+        _ja["SaveOk"] = "現在の描画をフル画像として保存：{0}（モデル/マテリアルは未変更）。";
+        _en["SaveOk"] = "Saved full texture to: {0} (no model/material changes).";
+
+        _zh["ExportLayerOk"] = "已导出【仅绘画层（透明底）】到：{0}（未覆盖原文件，未修改模型）。";
+        _ja["ExportLayerOk"] = "【描画レイヤのみ（透明）】を出力：{0}（既存ファイル非上書き・モデル未変更）。";
+        _en["ExportLayerOk"] = "Exported paint-only layer to: {0} (no overwrite, no model changes).";
+
+        _zh["ClearToSaved"] = "已清空当前未保存的绘制，回退到上一次保存的输出贴图。";
+        _ja["ClearToSaved"] = "未保存の描画をクリアし、最後に保存した出力に戻しました。";
+        _en["ClearToSaved"] = "Cleared unsaved edits and reverted to last saved output.";
+
+        _zh["ClearToOriginal"] = "未找到已保存输出，已回退到原始主纹理副本。";
+        _ja["ClearToOriginal"] = "保存済みの出力がないため、元のメインテクスチャのコピーに戻りました。";
+        _en["ClearToOriginal"] = "No saved output found; reverted to original main texture copy.";
+
+        _zh["ClearToBlank"] = "未找到可回退的贴图，已生成默认空白副本。";
+        _ja["ClearToBlank"] = "戻すテクスチャがないため、空のコピーを作成しました。";
+        _en["ClearToBlank"] = "No texture to revert; created a blank copy.";
+
+        _zh["LocateCreateOk"] = "已创建目录：";
+        _ja["LocateCreateOk"] = "ディレクトリを作成しました：";
+        _en["LocateCreateOk"] = "Created directory: ";
+
+        _zh["LocateExists"] = "目录已存在：";
+        _ja["LocateExists"] = "ディレクトリは既に存在します：";
+        _en["LocateExists"] = "Directory exists: ";
+
+        _zh["LocateOpenOk"] = "已打开目录：";
+        _ja["LocateOpenOk"] = "ディレクトリを開きました：";
+        _en["LocateOpenOk"] = "Opened directory: ";
+
+        // ---- 作者窗口 ----
+        _zh["AuthorWindowTitle"] = "LGC网格UV绘画工具 - 关于作者";
+        _ja["AuthorWindowTitle"] = "LGCメッシュUVペイントツール - 作者について";
+        _en["AuthorWindowTitle"] = "LGC Mesh UV Painter - About";
+
+        _zh["AuthorName"] = "作者：copilote + LGC";
+        _ja["AuthorName"] = "作者：copilote + LGC";
+        _en["AuthorName"] = "Author: copilote + LGC";
+
+        _zh["VersionInfo"] = "版本：{0}";
+        _ja["VersionInfo"] = "バージョン：{0}";
+        _en["VersionInfo"] = "Version: {0}";
+
+        _zh["ContactInfo"] = "联系：GitHub LgcChina";
+        _ja["ContactInfo"] = "連絡先：GitHub LgcChina";
+        _en["ContactInfo"] = "Contact: GitHub LgcChina";
+
+        _zh["ToolDesc"] = "说明：基于UV进行贴图绘制、橡皮擦、UV孤岛填充，支持实时预览与多格式导出。";
+        _ja["ToolDesc"] = "説明：UVに基づくペイント/消しゴム/アイランド塗りつぶし、リアルタイム表示と出力対応。";
+        _en["ToolDesc"] = "Description: UV-based painting, eraser, UV island fill, realtime preview and exports.";
+    }
+
+    // [LGC 修改] 获取文本；未命中返回键名本身作为兜底
+    public string GetText(string key)
+    {
+        InitLanguageData();
+        Dictionary<string, string> dict =
+            CurrentLang == EditorLanguage.Japanese ? _ja :
+            CurrentLang == EditorLanguage.English ? _en : _zh;
+
+        return dict.TryGetValue(key, out var val) ? val : key;
+    }
+}
+#endif
