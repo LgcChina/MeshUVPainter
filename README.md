@@ -1,76 +1,46 @@
-# VPM Package Template
+# LGC网格UV绘画工具
+LGC网格UV绘画工具 - VRChat基于Unity编辑器，基于网格Mesh UV进行颜色绘制的工具
+Unity编辑器专用工具（适配VRChat生态），专注于Mesh UV贴图颜色快速绘制，支持多语言切换、简化UV画图上色流程。
 
-Starter for making Packages, including automation for building and publishing them.
+## 📌 核心特性
+- 🎨 便捷的UV颜色绘制：支持画笔/橡皮擦/UV孤岛填充模式，笔刷大小/硬度可调节；
+- 🌐 多语言切换：内置中/日/英三种语言，面板文本全适配；
+- 📂 资源目录定位：一键跳转Project面板输出目录，文件夹缺失自动创建；
+- ℹ️ 作者信息面板：点击底部版本/作者信息，弹出独立面板查看详细信息；
+- 🎯 轻量化：纯编辑器工具，无运行时代码，不增加项目体积。
 
-Once you're all set up, you'll be able to push changes to this repository and have .zip and .unitypackage versions automatically generated, and a listing made which works in the VPM for delivering updates for this package. If you want to make a listing with a variety of packages, check out our [template-package-listing](https://github.com/vrchat-community/template-package-listing) repo.
+## 🛠️ 安装方法（推荐VCC安装）
+### 方式1：VRChat Creator Companion（VCC）/ALCOM
+https://lgcchina.github.io/LGC-VRC-Packages/
 
-## ▶ Getting Started
 
-* Press [![Use This Template](https://user-images.githubusercontent.com/737888/185467681-e5fdb099-d99f-454b-8d9e-0760e5a6e588.png)](https://github.com/vrchat-community/template-package/generate)
-to start a new GitHub project based on this template.
-  * Choose a fitting repository name and description.
-  * Set the visibility to 'Public'. You can also choose 'Private' and change it later.
-  * You don't need to select 'Include all branches.'
-* Clone this repository locally using Git.
-  * If you're unfamiliar with Git and GitHub, [visit GitHub's documentation](https://docs.github.com/en/get-started/quickstart/git-and-github-learning-resources) to learn more.
-* Add the folder to Unity Hub and open it as a Unity Project.
-* After opening the project, wait while the VPM resolver is downloaded and added to your project.
-  * This gives you access to the VPM Package Maker and Package Resolver tools.
+### 方式2：手动安装/不建议
+1. 下载仓库Release包（Releases页面获取`com.lgcchina.mesh-uv-painter-1.0.0.zip`）；
+2. 解压后将`com.lgcchina.mesh-uv-painter`文件夹放入Unity项目的`Packages/`目录下。
 
-## 🚇 Migrating Assets Package
-Full details at [Converting Assets to a VPM Package](https://vcc.docs.vrchat.com/guides/convert-unitypackage)
+## 📖 使用说明
+1. 打开Unity（2022.3版本），在顶部菜单栏找到「LGC → 网格UV绘画工具」，打开工具面板；
+2. 绑定对象：选择带MeshRenderer/SkinnedMeshRenderer的GameObject，拖入后加载材质和纹理；
+3. 绘制操作：选择画笔/橡皮擦模式，调整笔刷参数，在右侧UV视图中绘制颜色；
+4. 辅助功能：
+   - 点击「定位到Project面板资源」，快速跳转到输出目录；
+   - 顶部下拉框切换语言（中/日/英）；
+   - 点击底部版本信息，查看作者详细信息。
 
-## ✏️ Working on Your Package
+## ⚠️ 注意事项
+1. Unity版本要求：默认支持2022.3.x（适配VRChat主流Unity版本）；
+2. 依赖说明：无需额外安装其他插件；
+3. 数据安全：绘制前建议备份原始纹理，避免误操作导致数据丢失；
+4. 兼容性：仅支持编辑器环境使用，不会打入VRChat构建包。
 
-* Delete the "Packages/com.vrchat.demo-template" directory or reuse it for your own package.
-  * If you reuse the package, don't forget to rename it and add generated meta files to your repository!
-* Update the `.gitignore` file in the "Packages" directory to include your package.
-  * For example, change `!com.vrchat.demo-template` to `!com.username.package-name`.
-  * `.gitignore` files normally *exclude* the contents of your "Packages" directory. This `.gitignore` in this template show how to *include* the demo package. You can easily change this out for your own package name.
-* Open the Unity project and work on your package's files in your favorite code editor.
-* When you're ready, commit and push your changes.
-* Once you've set up the automation as described below, you can easily publish new versions.
+## 📜 版本日志
+### v1.0.0（初始版本）
+- 核心UV颜色绘制功能；
+- 多语言（中/日/英）切换；
+- 资源目录定位（自动创建缺失文件夹）；
+- 作者信息面板。
 
-## 🤖 Setting up the Automation
-
-Create a repository variable with the name and value described below.
-For details on how to create repository variables, see [Creating Configuration Variables for a Repository](https://docs.github.com/en/actions/learn-github-actions/variables#creating-configuration-variables-for-a-repository).
-Make sure you are creating a **repository variable**, and not a **repository secret**.
-
-* `PACKAGE_NAME`: the name of your package, like `com.vrchat.demo-template`.
-
-Finally, go to the "Settings" page for your repo, then choose "Pages", and look for the heading "Build and deployment". Change the "Source" dropdown from "Deploy from a branch" to "GitHub Actions".
-
-That's it!
-Some other notes:
-* We highly recommend you keep the existing folder structure of this template.
-  * The root of the project should be a Unity project.
-  * Your packages should be in the "Packages" directory.
-  * If you deviate from this folder structure, you'll need to update the paths that assume your package is in the "Packages" directory on lines 24, 38, 41 and 57.
-* If you want to store and generate your web files in a folder other than "Website" in the root, you can change the `listPublicDirectory` item [here in build-listing.yml](.github/workflows/build-listing.yml#L17).
-
-## 🎉 Publishing a Release
-
-You can make a release by running the [Build Release](.github/workflows/release.yml) action. The version specified in your `package.json` file will be used to define the version of the release.
-
-## 📃 Rebuilding the Listing
-
-Whenever you make a change to a release - manually publishing it, or manually creating, editing or deleting a release, the [Build Repo Listing](.github/workflows/build-listing.yml) action will make a new index of all the releases available, and publish them as a website hosted fore free on [GitHub Pages](https://pages.github.com/). This listing can be used by the VPM to keep your package up to date, and the generated index page can serve as a simple landing page with info for your package. The URL for your package will be in the format `https://username.github.io/repo-name`.
-
-## 🏠 Customizing the Landing Page (Optional)
-
-The action which rebuilds the listing also publishes a landing page. The source for this page is in `Website/index.html`. The automation system uses [Scriban](https://github.com/scriban/scriban) to fill in the objects like `{{ this }}` with information from the latest release's manifest, so it will stay up-to-date with the name, id and description that you provide there. You are welcome to modify this page however you want - just use the existing `{{ template.objects }}` to fill in that info wherever you like. The entire contents of your "Website" folder are published to your GitHub Page each time.
-
-## 💻 Technical Stuff
-
-You are welcome to make your own changes to the automation process to make it fit your needs, and you can create Pull Requests if you have some changes you think we should adopt. Here's some more info on the included automation:
-
-### Build Release Action
-[release.yml](/.github/workflows/release.yml)
-
-This is a composite action combining a variety of existing GitHub Actions and some shell commands to create both a .zip of your Package and a .unitypackage. It creates a release which is named for the `version` in the `package.json` file found in your target Package, and publishes the zip, the unitypackage and the package.json file to this release.
-
-### Build Repo Listing
-[build-listing.yml](.github/workflows/build-listing.yml)
-
-This is a composite action which builds a vpm-compatible [Repo Listing](https://vcc.docs.vrchat.com/vpm/repos) based on the releases you've created. In order to find all your releases and combine them into a listing, it checks out [another repository](https://github.com/vrchat-community/package-list-action) which has a [Nuke](https://nuke.build/) project which includes the VPM core lib to have access to its types and methods. This project will be expanded to include more functionality in the future - for now, the action just calls its `BuildRepoListing` target.
+## ✨ 作者信息
+- 作者：LgcChina
+- GitHub：https://github.com/LgcChina
+- 功能建议/BUG反馈：提交Issue至本仓库即可，虽然我不一定会看，修也是丢给ai修。
