@@ -316,9 +316,45 @@ public sealed class EditorLanguageManager
         _ja["ContactInfo"] = "連絡先：GitHub LgcChina";
         _en["ContactInfo"] = "Contact: GitHub LgcChina";
 
-        _zh["ToolDesc"] = "说明：基于UV进行贴图绘制、橡皮擦、UV孤岛填充，支持实时预览与多格式导出。";
-        _ja["ToolDesc"] = "説明：UVベースのペイント/消しゴム/アイランド塗りつぶし、リアルタイム表示と出力に対応。";
-        _en["ToolDesc"] = "Description: UV-based painting, eraser, island fill, realtime preview and exports.";
+// 工具详细说明（中/日/英多语言配置）
+        // 中文版本说明
+        _zh["ToolDescDetailed"] =
+            "当前版本特色\n" +
+            "- 支持基于 UV 的绘画、橡皮擦、UV 孤岛填充与孤岛橡皮擦。\n" +
+            "- 提供 UV 边界限制与孤岛隔离模式，使绘制更精准安全。\n" +
+            "- 所有操作支持 Undo/Redo，实时预览不修改原材质。\n" +
+            "- 输出目录统一管理，可快速定位导出贴图。\n\n" +
+            "当前版本基于 CPU 逐像素运行：\n" +
+            "- 逻辑清晰可靠，但在大分辨率贴图或连续笔刷操作下可能遇到性能瓶颈。\n\n" +
+            "未来版本规划：\n" +
+            "- 正在研究迁移至 GPU（RenderTexture + Shader/Compute Shader）绘制与实时预览。\n" +
+            "- GPU 版本将显著提高绘画流畅度，减少卡顿并提升超大贴图的编辑效率。";
+
+        // 日文版本说明
+        _ja["ToolDescDetailed"] =
+            "現在のバージョンの機能\n" +
+            "- UVベースのペイント、消しゴム、UVアイランドの塗りつぶし、アイランド消しゴムをサポートします。\n" +
+            "- UV境界拘束とアイランド分離モードにより、より正確で安全なペイントが可能になります。\n" +
+            "- すべての操作で元に戻す/やり直しが可能になり、元のマテリアルを変更することなくリアルタイムプレビューが可能です。\n" +
+            "- 統合された出力ディレクトリ管理により、テクスチャの検索とエクスポートを迅速に行うことができます。\n\n" +
+            "現在のバージョンはCPUでピクセル単位で動作します:\n" +
+            "- 明確で信頼性の高いロジックですが、高解像度のテクスチャや連続したブラシ操作ではパフォーマンスのボトルネックが発生する可能性があります。\n\n" +
+            "将来のバージョンの計画:\n" +
+            "- 現在、GPU（レンダーテクスチャ + シェーダー/コンピュートシェーダー）ペイントとリアルタイムプレビューへの移行を検討しています。\n" +
+            "- GPUバージョンでは、ペイントの滑らかさが大幅に向上し、スタッターが軽減され、非常に大きなテクスチャの編集効率が向上します。";
+
+        // 英文版本说明
+        _en["ToolDescDetailed"] =
+            "Current Version Features\n" +
+            "- Supports UV-based painting, eraser, UV island filling, and island eraser.\n" +
+            "- Provides UV boundary constraints and island isolation modes for more precise and safer painting.\n" +
+            "- All operations support Undo/Redo, with real-time preview without modifying original materials.\n" +
+            "- Unified output directory management for quick texture location and export.\n\n" +
+            "Current version runs on CPU pixel-by-pixel:\n" +
+            "- Clear and reliable logic, but may encounter performance bottlenecks with large-resolution textures or continuous brush operations.\n\n" +
+            "Future Version Plans:\n" +
+            "- Currently researching migration to GPU (RenderTexture + Shader/Compute Shader) painting and real-time preview.\n" +
+            "- The GPU version will significantly improve painting smoothness, reduce stuttering, and enhance the editing efficiency of very large textures.";
     }
 
     // 获取文本；未命中返回 key 本身作为兜底
