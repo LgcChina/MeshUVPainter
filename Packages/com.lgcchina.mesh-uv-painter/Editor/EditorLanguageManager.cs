@@ -2,7 +2,7 @@
 // EditorLanguageManager.cs
 // 单例 + 多语言文本管理（Chinese / Japanese / English）
 // 用途：被编辑器工具与“关于作者”窗口统一调用
-// 本版新增：ModeIslandErase / ToggleUVBoundaryLimit / ToggleIslandIsolation
+// 本版新增：ModeIslandErase / ToggleUVBoundaryLimit / ToggleIslandIsolation / 对称绘画相关键
 
 using System.Collections.Generic;
 using UnityEditor;
@@ -188,6 +188,27 @@ public sealed class EditorLanguageManager
         _ja["ToggleIslandIsolation"] = "アイソレーション（現在のアイランドのブラシ/消しのみ）";
         _en["ToggleIslandIsolation"] = "Island Isolation (affect current island only)";
 
+        // ---- 新增：对称绘画 ----
+        _zh["SymmetryTitle"] = "对称绘画";
+        _ja["SymmetryTitle"] = "対称ペイント";
+        _en["SymmetryTitle"] = "Symmetry Painting";
+
+        _zh["SymmetryEnable"] = "启用对称绘画";
+        _ja["SymmetryEnable"] = "対称ペイントを有効化";
+        _en["SymmetryEnable"] = "Enable symmetry painting";
+
+        _zh["SymmetryLock"] = "锁定对称轴";
+        _ja["SymmetryLock"] = "対称軸をロック";
+        _en["SymmetryLock"] = "Lock symmetry axis";
+
+        _zh["SymmetryReset"] = "重置对称轴（垂直 0.5）";
+        _ja["SymmetryReset"] = "対称軸をリセット（縦0.5）";
+        _en["SymmetryReset"] = "Reset axis (vertical 0.5)";
+
+        _zh["SymmetryHelp"] = "在右侧画布拖动端点或线体可移动/旋转；锁定后禁止拖动。";
+        _ja["SymmetryHelp"] = "右側キャンバスで端点/線をドラッグして移動/回転；ロック中はドラッグ不可。";
+        _en["SymmetryHelp"] = "Drag endpoints/line on the canvas to move/rotate; locked = no drag.";
+
         // ---- 右侧顶部按钮 ----
         _zh["ResetViewBtn"] = "重置视图";
         _ja["ResetViewBtn"] = "ビューをリセット";
@@ -315,6 +336,15 @@ public sealed class EditorLanguageManager
         _zh["ContactInfo"] = "联系：GitHub LgcChina";
         _ja["ContactInfo"] = "連絡先：GitHub LgcChina";
         _en["ContactInfo"] = "Contact: GitHub LgcChina";
+
+        // ---- 对称绘画提示 & UV叠加折叠面板 ----
+        _zh["SymmetryEditingBlockPaint"] = "正在调整对称轴，已暂时禁用绘画。请先锁定或关闭对称模式。";
+        _ja["SymmetryEditingBlockPaint"] = "対称軸を編集中です。ペイントは一時的に無効です。先に軸をロックするか対称モードを無効にしてください。";
+        _en["SymmetryEditingBlockPaint"] = "Symmetry axis is being edited. Painting is temporarily disabled. Please lock the axis or disable symmetry first.";
+
+        _zh["UVOverlayFoldout"] = "UV 线条叠加";
+        _ja["UVOverlayFoldout"] = "UV オーバーレイ";
+        _en["UVOverlayFoldout"] = "UV Overlay";
 
         // 工具详细说明（中/日/英多语言配置）
         // 中文版本说明
