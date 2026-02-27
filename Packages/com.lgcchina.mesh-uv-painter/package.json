@@ -1,7 +1,7 @@
 {
   "name": "com.lgcchina.mesh-uv-painter",
   "displayName": "LGC网格UV绘画工具",
-  "version": "2.0.0",
+  "version": "2.4.1",
   "unity": "2022.3",
   "description": "LGC网格UV绘画工具 - VRChat基于Unity编辑器，基于网格Mesh UV进行颜色绘制的工具，多语言切换",
   "author": {
@@ -13,3 +13,4 @@
   "keywords": [ "VRChat", "Unity", "MeshUV", "颜色绘制", "编辑器工具","painter","Editor" ]
 
 }
+
