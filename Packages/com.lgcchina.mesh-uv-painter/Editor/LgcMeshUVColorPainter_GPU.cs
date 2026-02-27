@@ -1,18 +1,5 @@
-﻿#if UNITY_EDITOR
+#if UNITY_EDITOR
 // LGC网格UV绘画工具（GPU版） - Unity 2022+
-// LgcMeshUVColorPainter_GPU.cs (v2.0.0)
-//
-// 本版（v2.0.0）更新：
-//    A)【移除】撤销快照分辨率选项，统一使用画布实际分辨率保存快照；
-//    B)【优化】长笔划 Dispatch 采样间距：spacing = max(1, brushSize * (0.7 - 0.4 * hardness));
-//    C)【重构】减少 ComputeShader 调参重复：新增 Setup* 封装方法；
-// 2)【修复】补回“画笔与填充”参数 UI（颜色/半径/不透明度/硬度），与语言字典键一致；
-//    - 位置：模式按钮（DrawModeButtons）之后，“边界与隔离”之前；
-//    - 与键盘快捷键 [ / ] 联动；与 GPU 调用参数一致。
-//
-// 仍保持：
-// - 工具内纯内存 RenderTexture 快照栈；
-// - 与 LGCPaint.compute KBrush/KFillIsland 兼容；
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -111,8 +98,6 @@ public class LgcMeshUVColorPainter : EditorWindow
     private Stack<RenderTexture> redoStack = new Stack<RenderTexture>();
     private const int UNDO_LIMIT = 50; // 可在此调大/调小
 
-    // ★ 已移除：SnapshotRes 枚举与 snapshotResolution 字段（v2.3.1+）
-
     // 环形池（按尺寸复用 RT）
     private class RTPool
     {
@@ -186,6 +171,9 @@ public class LgcMeshUVColorPainter : EditorWindow
         infoMessage = L.GetText("InfoWelcome"); // 初始提示
         LoadComputeIfNeeded();                  // 计算着色器装载
         rtPool = new RTPool((w, h) => NewRT(w, h));
+
+        // ★ 允许接收 MouseMove 事件，以便未按下时也能重绘预览
+        wantsMouseMove = true;
     }
 
     private void OnDestroy()
@@ -200,7 +188,7 @@ public class LgcMeshUVColorPainter : EditorWindow
     private void OnGUI()
     {
         var L = EditorLanguageManager.Instance; L.InitLanguageData();
-        HandleGlobalShortcuts(Event.current); // ★ 捕获 Ctrl/Cmd+Z / Ctrl/Cmd+Y
+        HandleGlobalShortcuts(Event.current); // 捕获 Ctrl/Cmd+Z / Ctrl/Cmd+Y
 
         // 顶部工具条：右对齐语言下拉
         using (new GUILayout.HorizontalScope(EditorStyles.toolbar))
@@ -319,7 +307,7 @@ public class LgcMeshUVColorPainter : EditorWindow
         GUILayout.Label(L.GetText("ModeTitle"), EditorStyles.boldLabel);
         DrawModeButtons();
 
-        // ★★ 画笔与填充（新增 UI，恢复可视化调参）★★
+        // 画笔与填充
         EditorGUILayout.Space(8);
         GUILayout.Label(L.GetText("BrushAndFill"), EditorStyles.boldLabel);
         brushColor = EditorGUILayout.ColorField(L.GetText("BrushOrFillColor"), brushColor);
@@ -350,8 +338,6 @@ public class LgcMeshUVColorPainter : EditorWindow
                 }
             }
         }
-
-        // （已移除）撤销快照分辨率下拉
 
         // UV 叠加（默认折叠）
         EditorGUILayout.Space(4);
@@ -449,6 +435,17 @@ public class LgcMeshUVColorPainter : EditorWindow
                                areaRect.y + (areaRect.height - previewH) * 0.5f,
                                previewW, previewH);
 
+        // ★ 实时刷新笔刷预览：在预览区域内的鼠标移动/进入/离开时重绘
+        var e = Event.current;
+        if (e != null)
+        {
+            bool hover = previewRect.Contains(e.mousePosition);
+            if (e.type == EventType.MouseMove || e.type == EventType.MouseEnterWindow || e.type == EventType.MouseLeaveWindow)
+            {
+                if (hover || e.type != EventType.MouseMove) Repaint();
+            }
+        }
+
         // 棋盘格
         if (Event.current.type == EventType.Repaint && checkerTex != null)
             DrawTiledTexture(previewRect, checkerTex, 16);
@@ -468,7 +465,7 @@ public class LgcMeshUVColorPainter : EditorWindow
         // 绘制交互（GPU）
         HandlePaintingEvents(viewRect);
 
-        // 笔刷预览
+        // 笔刷预览（将根据当前 Event.mousePosition 每帧重绘）
         DrawBrushPreview(previewRect, viewRect);
     }
 
@@ -683,7 +680,7 @@ public class LgcMeshUVColorPainter : EditorWindow
         Vector2 pB = new Vector2(uvB.x * (paintRT.width - 1), uvB.y * (paintRT.height - 1));
         float distPixels = Vector2.Distance(pA, pB);
 
-        // ★ v2.3.1+：优化长笔划采样间距（兼顾硬度）
+        // 优化长笔划采样间距（兼顾硬度）
         float spacing = Mathf.Max(1f, brushSize * (0.7f - 0.4f * brushHardness));
 
         int steps = Mathf.Max(1, Mathf.CeilToInt(distPixels / spacing));
@@ -1191,7 +1188,7 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
     }
 
-    // ★ 统一使用画布分辨率的快照（移除低分辨率选项）
+    // 统一使用画布分辨率的快照
     private RenderTexture GetSnapshotTarget()
     {
         return rtPool.Get(paintRT.width, paintRT.height);
@@ -1237,7 +1234,7 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     private void ResetView() { zoom = 1f; viewCenter = new Vector2(0.5f, 0.5f); }
 
-    // ====== —— 其余必要方法（来源于 v2.2.x/v2.3.0） —— ======
+    // ====== —— 其余必要方法（来源于 v2.2.x/v2.3.x） —— ======
     private void LoadComputeIfNeeded()
     {
         if (computeReady && csPaint != null) return;
@@ -1462,11 +1459,7 @@ public class LgcMeshUVColorPainter : EditorWindow
         Repaint();
     }
 
-    // ====== v2.3.1+ 公共参数封装 ======
-
-    /// <summary>
-    /// 准备并绑定掩码缓冲，设置边界/隔离开关（若掩码不可用则自动降级为关闭）。
-    /// </summary>
+    // ====== 公共参数封装 ======
     private void SetupCommonMasks(int kernel)
     {
         bool maskAvailable = EnsureMaskBuffersUpToDate();
@@ -1476,7 +1469,6 @@ public class LgcMeshUVColorPainter : EditorWindow
             csPaint.SetBuffer(kernel, "_IslandId", islandIdBuffer);
         }
 
-        // 当无掩码可用时自动降级为关闭
         int enableBoundary = (uvBoundaryLimitEnabled && maskAvailable) ? 1 : 0;
         bool canIso = islandIsolationEnabled && maskAvailable && activeIslandId >= 0;
         int enableIsolation = canIso ? 1 : 0;
@@ -1487,9 +1479,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         csPaint.SetInt("_ActiveIslandId", activeId);
     }
 
-    /// <summary>
-    /// 设置笔刷/橡皮通用参数。
-    /// </summary>
     private void SetupCommonBrushParams(int kernel, RectInt rect, Vector2Int center, int radius, bool isBrushMode)
     {
         csPaint.SetInts("_RectXYWH", new int[] { rect.x, rect.y, rect.width, rect.height });
@@ -1502,9 +1491,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         csPaint.SetInt("_Mode", isBrushMode ? 0 : 1);
     }
 
-    /// <summary>
-    /// 设置整岛填充/擦除通用参数。
-    /// </summary>
     private void SetupCommonFillParams(int kernel, int islandId, bool isFillMode)
     {
         csPaint.SetInts("_TexSize", new int[] { paintRT.width, paintRT.height });
@@ -1516,5 +1502,5 @@ public class LgcMeshUVColorPainter : EditorWindow
 }
 #endif
 // ------------------------------
-// 底部版本行（copilote + LGC + v2.3.2）
+// 底部版本行（copilote + LGC + v2.3.3）
 // ------------------------------
