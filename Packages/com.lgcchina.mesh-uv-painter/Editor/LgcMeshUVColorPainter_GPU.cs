@@ -1,5 +1,13 @@
 #if UNITY_EDITOR
 // LGC网格UV绘画工具（GPU版） - Unity 2022+
+// LgcMeshUVColorPainter_GPU.cs (v2.4.1)
+//
+// 本版（v2.4.1）更新：
+// 1) 对称模式启用但未锁定时，暂时禁用绘画（避免误画）。
+// 2) 对称线条锚点放大，并随 zoom 自适应；线段命中阈值放宽；锚点外加浅色描边；提供 Move/Resize 鼠标指针反馈。
+// 3) “UV 线条叠加” Foldout 使用多语言 L.GetText("UVOverlayFoldout").
+//
+// 说明：已在 DrawAndHandleSymmetryGizmo/HandlePaintingEvents/DrawLeftPanel 中进行局部修改，其余逻辑保持不变。
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -12,7 +20,7 @@ using Object = UnityEngine.Object;
 
 public class LgcMeshUVColorPainter : EditorWindow
 {
-    internal const string VERSION = "v2.0.0"; // ★ 每次修改请更新版本号
+    internal const string VERSION = "v2.4.1"; // ★ 每次修改请更新版本号
     public static string VersionString => VERSION;
     private const string LOG_PREFIX = "[LGC网格UV绘画工具(GPU)] ";
 
@@ -48,7 +56,7 @@ public class LgcMeshUVColorPainter : EditorWindow
     private int kFillIsland;       // 孤岛填充/擦除（整岛）
     private bool computeReady = false;
 
-    // UV覆盖掩码 / 孤岛ID（CPU生成，一次性）
+    // UV 覆盖掩码 / 孤岛 ID（CPU 生成，一次性）
     private int maskW, maskH;
     private int[] uvMask;       // 0/1
     private int[] islandIdMask; // -1/0..N
@@ -57,7 +65,7 @@ public class LgcMeshUVColorPainter : EditorWindow
     private bool uvMaskDirty = true;
     private bool islandsDirty = true;
 
-    // GPU侧共享缓冲
+    // GPU 侧共享缓冲
     private ComputeBuffer uvMaskBuffer;   // int per pixel
     private ComputeBuffer islandIdBuffer; // int per pixel
 
@@ -87,18 +95,24 @@ public class LgcMeshUVColorPainter : EditorWindow
     private float brushHardness = 1.0f; // 0..1
 
     // 边界/隔离（默认开，但当无掩码可用时自动降级为关闭）
-    private bool uvBoundaryLimitEnabled = true; // UV边界限制（默认开）
+    private bool uvBoundaryLimitEnabled = true; // UV 边界限制（默认开）
     private bool islandIsolationEnabled = true; // 孤岛隔离（默认开）
 
     // 实时预览（移动到“边界与隔离”组）
     private bool enableRealTimePreview = false;
+
+    // ====== 对称绘画（新增） ======
+    private bool symmetryEnabled = false;
+    private bool symmetryLocked = false;
+    private Vector2 symA = new Vector2(0.5f, 0.0f);
+    private Vector2 symB = new Vector2(0.5f, 1.0f);
+    private bool draggingSymA = false, draggingSymB = false, draggingSymLine = false;
 
     // ====== 撤销/重做（工具内纯内存快照） ======
     private Stack<RenderTexture> undoStack = new Stack<RenderTexture>();
     private Stack<RenderTexture> redoStack = new Stack<RenderTexture>();
     private const int UNDO_LIMIT = 50; // 可在此调大/调小
 
-    // 环形池（按尺寸复用 RT）
     private class RTPool
     {
         private readonly Dictionary<(int, int), Stack<RenderTexture>> _dict = new();
@@ -136,25 +150,19 @@ public class LgcMeshUVColorPainter : EditorWindow
     }
     private RTPool rtPool;
 
-    // 背景棋盘格
     private static Texture2D checkerTex;
 
-    // 输出 PNG
     private string outputAssetPath;
-    private bool appliedToOutput = false; // 是否已保存过（避免误删）
+    private bool appliedToOutput = false;
     private bool outputCreatedInSession = false;
 
-    // 状态提示
     private string infoMessage;
     private MessageType infoType = MessageType.Info;
 
-    // 左侧滚动
     private Vector2 leftScroll;
 
-    // 资源输出目录
     private string _targetResourceDir = "Assets/LGC/Tools/UV绘画/输出图片";
 
-    // ====== 菜单 ======
     [MenuItem("LGC/LGC网格UV绘画工具（GPU）")]
     public static void ShowWindow()
     {
@@ -168,11 +176,9 @@ public class LgcMeshUVColorPainter : EditorWindow
         EnsureCheckerTexture();
         mode = PaintMode.Brush;
         var L = EditorLanguageManager.Instance; L.InitLanguageData();
-        infoMessage = L.GetText("InfoWelcome"); // 初始提示
-        LoadComputeIfNeeded();                  // 计算着色器装载
+        infoMessage = L.GetText("InfoWelcome");
+        LoadComputeIfNeeded();
         rtPool = new RTPool((w, h) => NewRT(w, h));
-
-        // ★ 允许接收 MouseMove 事件，以便未按下时也能重绘预览
         wantsMouseMove = true;
     }
 
@@ -184,13 +190,11 @@ public class LgcMeshUVColorPainter : EditorWindow
         if (rtPool != null) rtPool.DisposeAll();
     }
 
-    // ====== GUI ======
     private void OnGUI()
     {
         var L = EditorLanguageManager.Instance; L.InitLanguageData();
-        HandleGlobalShortcuts(Event.current); // 捕获 Ctrl/Cmd+Z / Ctrl/Cmd+Y
+        HandleGlobalShortcuts(Event.current);
 
-        // 顶部工具条：右对齐语言下拉
         using (new GUILayout.HorizontalScope(EditorStyles.toolbar))
         {
             GUILayout.FlexibleSpace();
@@ -205,7 +209,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         EditorGUIUtility.labelWidth = Mathf.Max(160f, _leftPanelWidth - 160f);
 
         EditorGUILayout.BeginHorizontal();
-        // 左侧：工具区
         EditorGUILayout.BeginVertical(GUILayout.MinWidth(LEFT_PANEL_MIN_WIDTH), GUILayout.Width(_leftPanelWidth));
         GUILayout.Label(L.GetText("LeftPanelTitle"), EditorStyles.boldLabel);
         leftScroll = EditorGUILayout.BeginScrollView(leftScroll);
@@ -213,7 +216,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         EditorGUILayout.EndScrollView();
         EditorGUILayout.EndVertical();
 
-        // 右侧：绘制区
         EditorGUILayout.BeginVertical(GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
         GUILayout.Label(L.GetText("RightPanelTitle"), EditorStyles.boldLabel);
         rightPanelRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
@@ -221,7 +223,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         EditorGUILayout.EndVertical();
         EditorGUILayout.EndHorizontal();
 
-        // 底部作者/版本（可点击打开“关于作者”）
         EditorGUILayout.Space();
         var labelStyle = new GUIStyle(EditorStyles.centeredGreyMiniLabel)
         {
@@ -249,11 +250,10 @@ public class LgcMeshUVColorPainter : EditorWindow
     {
         if (e == null) return;
         if (e.type != EventType.KeyDown) return;
-        if (focusedWindow != this) return; // 仅当本窗口有焦点时生效
-        bool ctrl = e.control || e.command; // Win=Ctrl, macOS=Cmd
+        if (focusedWindow != this) return;
+        bool ctrl = e.control || e.command;
         if (!ctrl) return;
 
-        // Ctrl/Cmd + Z => 撤销；Shift + Ctrl/Cmd + Z 或 Ctrl/Cmd + Y => 重做
         if (e.keyCode == KeyCode.Z)
         {
             if (e.shift) DoRedo_Internal(); else DoUndo_Internal();
@@ -265,14 +265,12 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
     }
 
-    // ====== 左侧面板 ======
     private void DrawLeftPanel()
     {
         var L = EditorLanguageManager.Instance;
         var wrapHelp = new GUIStyle(EditorStyles.helpBox) { wordWrap = true };
         EditorGUILayout.LabelField(infoMessage, wrapHelp);
 
-        // 目标
         EditorGUI.BeginChangeCheck();
         targetObject = (GameObject)EditorGUILayout.ObjectField(L.GetText("TargetObject"), targetObject, typeof(GameObject), true);
         if (EditorGUI.EndChangeCheck())
@@ -282,7 +280,6 @@ public class LgcMeshUVColorPainter : EditorWindow
 
         using (new EditorGUI.DisabledScope(targetObject == null || targetMesh == null || targetRenderer == null))
         {
-            // 材质槽
             if (sharedMats != null && sharedMats.Length > 0)
             {
                 int newIndex = EditorGUILayout.Popup(L.GetText("MatSlot"), selectedMatIndex, matSlotNames);
@@ -302,12 +299,10 @@ public class LgcMeshUVColorPainter : EditorWindow
             }
         }
 
-        // 模式（互斥）
         EditorGUILayout.Space(8);
         GUILayout.Label(L.GetText("ModeTitle"), EditorStyles.boldLabel);
         DrawModeButtons();
 
-        // 画笔与填充
         EditorGUILayout.Space(8);
         GUILayout.Label(L.GetText("BrushAndFill"), EditorStyles.boldLabel);
         brushColor = EditorGUILayout.ColorField(L.GetText("BrushOrFillColor"), brushColor);
@@ -315,14 +310,13 @@ public class LgcMeshUVColorPainter : EditorWindow
         brushOpacity = EditorGUILayout.Slider(L.GetText("Opacity"), Mathf.Clamp01(brushOpacity), 0f, 1f);
         brushHardness = EditorGUILayout.Slider(L.GetText("Hardness"), Mathf.Clamp01(brushHardness), 0f, 1f);
 
-        // 边界与隔离 + 实时预览
         EditorGUILayout.Space(8);
         GUILayout.Label(L.GetText("BoundaryAndIsolationTitle"), EditorStyles.boldLabel);
         uvBoundaryLimitEnabled = EditorGUILayout.ToggleLeft(L.GetText("ToggleUVBoundaryLimit"), uvBoundaryLimitEnabled);
         islandIsolationEnabled = EditorGUILayout.ToggleLeft(L.GetText("ToggleIslandIsolation"), islandIsolationEnabled);
         using (new EditorGUI.DisabledScope(paintRT == null || targetRenderer == null))
         {
-            bool newRealtime = EditorGUILayout.Toggle("实时效果预览", enableRealTimePreview);
+            bool newRealtime = EditorGUILayout.Toggle(L.GetText("RealtimePreviewToggle"), enableRealTimePreview);
             if (newRealtime != enableRealTimePreview)
             {
                 enableRealTimePreview = newRealtime;
@@ -339,9 +333,27 @@ public class LgcMeshUVColorPainter : EditorWindow
             }
         }
 
-        // UV 叠加（默认折叠）
+        EditorGUILayout.Space(8);
+        GUILayout.Label(L.GetText("SymmetryTitle"), EditorStyles.boldLabel);
+        symmetryEnabled = EditorGUILayout.ToggleLeft(L.GetText("SymmetryEnable"), symmetryEnabled);
+        using (new EditorGUI.DisabledScope(!symmetryEnabled))
+        {
+            symmetryLocked = EditorGUILayout.ToggleLeft(L.GetText("SymmetryLock"), symmetryLocked);
+            using (new GUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button(L.GetText("SymmetryReset"), GUILayout.Width(200)))
+                {
+                    symA = new Vector2(0.5f, 0.0f);
+                    symB = new Vector2(0.5f, 1.0f);
+                    Repaint();
+                }
+            }
+            var help = new GUIStyle(EditorStyles.helpBox) { wordWrap = true };
+            EditorGUILayout.LabelField(L.GetText("SymmetryHelp"), help);
+        }
+
         EditorGUILayout.Space(4);
-        foldUVPanel = EditorGUILayout.Foldout(foldUVPanel, "UV 线条叠加", true);
+        foldUVPanel = EditorGUILayout.Foldout(foldUVPanel, L.GetText("UVOverlayFoldout"), true);
         if (foldUVPanel)
         {
             EditorGUI.indentLevel++;
@@ -351,7 +363,6 @@ public class LgcMeshUVColorPainter : EditorWindow
             EditorGUI.indentLevel--;
         }
 
-        // 保存 / 导出 / 清空 / 定位
         EditorGUILayout.Space(8);
         GUILayout.Label(L.GetText("GroupApplySaveLocate"), EditorStyles.boldLabel);
         using (new EditorGUI.DisabledScope(paintRT == null || targetRenderer == null))
@@ -402,7 +413,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         GUI.color = defaultColor;
     }
 
-    // ====== 右侧绘制区 ======
     private void DrawRightPanel(Rect containerRect)
     {
         var L = EditorLanguageManager.Instance;
@@ -425,7 +435,6 @@ public class LgcMeshUVColorPainter : EditorWindow
             return;
         }
 
-        // 计算预览rect（在 areaRect 内自适应）
         float cw = Mathf.Max(50f, areaRect.width - 8f);
         float ch = Mathf.Max(50f, areaRect.height - 8f);
         float aspect = (float)paintRT.width / Mathf.Max(1, paintRT.height);
@@ -435,9 +444,7 @@ public class LgcMeshUVColorPainter : EditorWindow
                                areaRect.y + (areaRect.height - previewH) * 0.5f,
                                previewW, previewH);
 
-        // ★ 实时刷新笔刷预览：在预览区域内的鼠标移动/进入/离开时重绘
-        var e = Event.current;
-        if (e != null)
+        var e = Event.current; if (e != null)
         {
             bool hover = previewRect.Contains(e.mousePosition);
             if (e.type == EventType.MouseMove || e.type == EventType.MouseEnterWindow || e.type == EventType.MouseLeaveWindow)
@@ -446,26 +453,21 @@ public class LgcMeshUVColorPainter : EditorWindow
             }
         }
 
-        // 棋盘格
         if (Event.current.type == EventType.Repaint && checkerTex != null)
             DrawTiledTexture(previewRect, checkerTex, 16);
 
-        // 绘制贴图（考虑视图窗口）
         Rect viewRect = GetViewRect();
         GUI.DrawTextureWithTexCoords(previewRect, paintRT,
             new Rect(viewRect.xMin, viewRect.yMin, viewRect.width, viewRect.height));
 
-        // UV 线叠加（立即模式）
         if (showUVOverlay && targetMesh != null && targetMesh.uv != null && targetMesh.uv.Length > 0)
             DrawUVImmediate(previewRect, viewRect, targetMesh, uvColor, uvAlpha);
 
-        // 交互（缩放、平移）
+        if (symmetryEnabled)
+            DrawAndHandleSymmetryGizmo(previewRect, viewRect);
+
         HandleViewNavigation(previewRect);
-
-        // 绘制交互（GPU）
         HandlePaintingEvents(viewRect);
-
-        // 笔刷预览（将根据当前 Event.mousePosition 每帧重绘）
         DrawBrushPreview(previewRect, viewRect);
     }
 
@@ -557,15 +559,130 @@ public class LgcMeshUVColorPainter : EditorWindow
         Handles.EndGUI();
     }
 
-    // ====== 绘制事件（GPU） ======
+    private void DrawAndHandleSymmetryGizmo(Rect rect, Rect viewRect)
+    {
+        Event e = Event.current; bool mouseIn = rect.Contains(e.mousePosition);
+
+        float handleBase = 14f; // 基础半径（像素）
+        float handleR = handleBase * Mathf.Clamp(Mathf.Sqrt(Mathf.Max(1f, zoom)), 1f, 2f); // 随 zoom 自适应
+
+        Vector2 MapUV(Vector2 uv)
+        {
+            float nx = (uv.x - viewRect.xMin) / Mathf.Max(1e-6f, viewRect.width);
+            float ny = (uv.y - viewRect.yMin) / Mathf.Max(1e-6f, viewRect.height);
+            return new Vector2(rect.x + nx * rect.width, rect.y + (1f - ny) * rect.height);
+        }
+
+        Vector2 aG = MapUV(symA), bG = MapUV(symB);
+
+        // 鼠标指针反馈：靠近端点 -> Resize，靠近线段 -> Move
+        {
+            Vector2 m = e.mousePosition;
+            float dLine = DistancePointToSegment(m, aG, bG);
+            bool nearA = (m - aG).sqrMagnitude <= handleR * handleR;
+            bool nearB = (m - bG).sqrMagnitude <= handleR * handleR;
+            bool nearLine = dLine <= handleR * 1.0f;
+            if (nearA || nearB)
+            {
+                var rA = new Rect(aG.x - handleR, aG.y - handleR, handleR * 2f, handleR * 2f);
+                var rB = new Rect(bG.x - handleR, bG.y - handleR, handleR * 2f, handleR * 2f);
+                EditorGUIUtility.AddCursorRect(rA, MouseCursor.ResizeUpLeft);
+                EditorGUIUtility.AddCursorRect(rB, MouseCursor.ResizeUpLeft);
+            }
+            else if (nearLine)
+            {
+                float minX = Mathf.Min(aG.x, bG.x) - handleR;
+                float minY = Mathf.Min(aG.y, bG.y) - handleR;
+                float maxX = Mathf.Max(aG.x, bG.x) + handleR;
+                float maxY = Mathf.Max(aG.y, bG.y) + handleR;
+                EditorGUIUtility.AddCursorRect(new Rect(minX, minY, maxX - minX, maxY - minY), MouseCursor.MoveArrow);
+            }
+        }
+
+        bool canDrag = !symmetryLocked;
+        if (canDrag && mouseIn)
+        {
+            if (e.type == EventType.MouseDown && e.button == 0)
+            {
+                if ((e.mousePosition - aG).sqrMagnitude <= handleR * handleR) { draggingSymA = true; e.Use(); }
+                else if ((e.mousePosition - bG).sqrMagnitude <= handleR * handleR) { draggingSymB = true; e.Use(); }
+                else
+                {
+                    float d = DistancePointToSegment(e.mousePosition, aG, bG);
+                    if (d <= handleR * 1.0f) { draggingSymLine = true; e.Use(); }
+                }
+            }
+            else if (e.type == EventType.MouseDrag && (draggingSymA || draggingSymB || draggingSymLine))
+            {
+                Vector2 uvDelta = GUIToUVDirectionDelta(e.delta, rect, viewRect);
+                if (draggingSymA) { symA += uvDelta; ClampUV(ref symA); }
+                else if (draggingSymB) { symB += uvDelta; ClampUV(ref symB); }
+                else if (draggingSymLine) { symA += uvDelta; symB += uvDelta; ClampUV(ref symA); ClampUV(ref symB); }
+                e.Use(); Repaint();
+            }
+            else if (e.type == EventType.MouseUp)
+            {
+                draggingSymA = draggingSymB = draggingSymLine = false;
+            }
+        }
+
+        Handles.BeginGUI();
+        Handles.color = new Color(0.2f, 0.8f, 1f, 0.9f);
+        Handles.DrawAAPolyLine(3f, aG, bG);
+        Color hc = symmetryLocked ? new Color(0.2f, 0.8f, 1f, 0.6f) : new Color(0.2f, 0.8f, 1f, 1f);
+        DrawHandleDisc(aG, handleR, hc);
+        DrawHandleDisc(bG, handleR, hc);
+        Handles.EndGUI();
+
+        static float DistancePointToSegment(Vector2 p, Vector2 a, Vector2 b)
+        {
+            Vector2 ab = b - a; float t = Vector2.Dot(p - a, ab) / Mathf.Max(1e-6f, ab.sqrMagnitude);
+            t = Mathf.Clamp01(t); Vector2 proj = a + t * ab; return (p - proj).magnitude;
+        }
+        static void DrawHandleDisc(Vector2 center, float r, Color c)
+        {
+            var old = Handles.color;
+            var outline = new Color(c.r, c.g, c.b, 0.25f);
+            Handles.color = outline; Handles.DrawSolidDisc(center, Vector3.forward, r * 0.95f);
+            Handles.color = c; Handles.DrawSolidDisc(center, Vector3.forward, r * 0.60f);
+            Handles.color = old;
+        }
+    }
+
+    private static Vector2 GUIToUVDirectionDelta(Vector2 guiDelta, Rect rect, Rect viewRect)
+    {
+        float du = (guiDelta.x / Mathf.Max(1e-6f, rect.width)) * viewRect.width;
+        float dv = -(guiDelta.y / Mathf.Max(1e-6f, rect.height)) * viewRect.height;
+        return new Vector2(du, dv);
+    }
+
+    private static void ClampUV(ref Vector2 uv)
+    {
+        uv.x = Mathf.Clamp01(uv.x);
+        uv.y = Mathf.Clamp01(uv.y);
+    }
+
     private void HandlePaintingEvents(Rect viewRect)
     {
         if (!computeReady || paintRT == null) return;
         Event e = Event.current; if (e == null) return;
 
+        // ★ 对称模式启用但未锁定：暂时禁用绘画（避免误画）
+        if (symmetryEnabled && !symmetryLocked)
+        {
+            if (e.button == 0 && (e.type == EventType.MouseDown || e.type == EventType.MouseDrag || e.type == EventType.MouseUp))
+            {
+                var L = EditorLanguageManager.Instance;
+                infoMessage = L.GetText("SymmetryEditingBlockPaint");
+                infoType = MessageType.Info;
+                e.Use();
+                Repaint();
+                return;
+            }
+        }
+
         bool inside = previewRect.Contains(e.mousePosition);
 
-        // [ / ] 调整笔刷半径
         if (inside && e.type == EventType.KeyDown)
         {
             if (e.keyCode == KeyCode.LeftBracket || e.character == '[') { brushSize = Mathf.Max(1, brushSize - 1); e.Use(); Repaint(); }
@@ -582,47 +699,69 @@ public class LgcMeshUVColorPainter : EditorWindow
             return;
         }
 
-        // 屏幕->UV
         Vector2 local = e.mousePosition - previewRect.position;
         Vector2 local01 = new Vector2(Mathf.Clamp01(local.x / Mathf.Max(1, previewRect.width)), Mathf.Clamp01(local.y / Mathf.Max(1, previewRect.height)));
         Vector2 uv = new Vector2(viewRect.xMin + local01.x * viewRect.width, viewRect.yMax - local01.y * viewRect.height);
 
         if (e.button == 0)
         {
-            // 孤岛填充 / 孤岛橡皮：单击一次（GPU整岛处理）
             if (mode == PaintMode.Fill || mode == PaintMode.IslandErase)
             {
                 if (e.type == EventType.MouseDown)
                 {
                     BeginStrokeSnapshotIfNeeded();
-                    activeIslandId = GetIslandIdAtUV_CPU(uv);
-                    if (activeIslandId >= 0 && islandIdBuffer != null)
+                    int island = GetIslandIdAtUV_CPU(uv);
+                    if (island >= 0 && islandIdBuffer != null) { GPU_FillIsland(island, mode == PaintMode.Fill); }
+                    else { infoMessage = EditorLanguageManager.Instance.GetText("InfoNoIslandData"); infoType = MessageType.Info; }
+                    if (symmetryEnabled)
                     {
-                        GPU_FillIsland(activeIslandId, mode == PaintMode.Fill);
-                        EndStrokeApply(); _strokeActive = false; // 单击型操作直接收束
+                        Vector2 muv = MirrorUVAcrossAxis(uv);
+                        if (IsUVInside01(muv))
+                        {
+                            int islandM = GetIslandIdAtUV_CPU(muv);
+                            if (islandM >= 0 && islandIdBuffer != null) GPU_FillIsland(islandM, mode == PaintMode.Fill);
+                        }
                     }
-                    else
-                    {
-                        infoMessage = EditorLanguageManager.Instance.GetText("InfoNoIslandData");
-                        infoType = MessageType.Info;
-                    }
+                    EndStrokeApply(); _strokeActive = false;
                     e.Use(); Repaint();
                 }
                 return;
             }
 
-            // 画笔 / 橡皮：按压并拖动（GPU局部刷写）
             if (e.type == EventType.MouseDown)
             {
                 BeginStrokeSnapshotIfNeeded();
                 isPainting = true; lastUV = uv; _strokeActive = true;
                 activeIslandId = islandIsolationEnabled ? GetIslandIdAtUV_CPU(uv) : -1;
                 GPU_PaintAtUV(uv, mode == PaintMode.Brush);
+                if (symmetryEnabled)
+                {
+                    Vector2 muv = MirrorUVAcrossAxis(uv);
+                    if (IsUVInside01(muv))
+                    {
+                        int prev = activeIslandId;
+                        int iso = islandIsolationEnabled ? GetIslandIdAtUV_CPU(muv) : -1;
+                        activeIslandId = iso; GPU_PaintAtUV(muv, mode == PaintMode.Brush); activeIslandId = prev;
+                    }
+                }
                 e.Use(); Repaint();
             }
             else if (e.type == EventType.MouseDrag && isPainting)
             {
                 GPU_DrawStrokeBetween(lastUV, uv, mode == PaintMode.Brush);
+                if (symmetryEnabled)
+                {
+                    Vector2 uvA = MirrorUVAcrossAxis(lastUV);
+                    Vector2 uvB = MirrorUVAcrossAxis(uv);
+                    if (IsUVInside01(uvA) || IsUVInside01(uvB))
+                    {
+                        int prev = activeIslandId;
+                        int iso = islandIsolationEnabled ? GetIslandIdAtUV_CPU(uvB) : -1;
+                        activeIslandId = iso;
+                        GPU_DrawStrokeBetween(uvA, uvB, mode == PaintMode.Brush);
+                        activeIslandId = prev;
+                    }
+                }
                 lastUV = uv;
                 e.Use(); Repaint();
             }
@@ -639,15 +778,13 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     private void BeginStrokeSnapshotIfNeeded()
     {
-        if (_strokeActive) return; // ★ 笔划合并护栏
-        BeginStrokeSnapshot();
-        _strokeActive = true;
+        if (_strokeActive) return; BeginStrokeSnapshot(); _strokeActive = true;
     }
 
-    // ====== GPU 调用：笔刷 ======
     private void GPU_PaintAtUV(Vector2 uv, bool isBrushMode)
     {
         if (!computeReady || paintRT == null || baseRT == null) return;
+        if (!IsUVInside01(uv)) return;
 
         int cx = Mathf.RoundToInt(uv.x * (paintRT.width - 1));
         int cy = Mathf.RoundToInt(uv.y * (paintRT.height - 1));
@@ -659,30 +796,26 @@ public class LgcMeshUVColorPainter : EditorWindow
         int rw = x1 - x0 + 1;
         int rh = y1 - y0 + 1;
 
-        // 绑定目标与基底
         csPaint.SetTexture(kBrush, "_PaintRT", paintRT);
         csPaint.SetTexture(kBrush, "_BaseRT", baseRT);
 
-        // 公共参数封装
         var rect = new RectInt(x0, y0, rw, rh);
         var center = new Vector2Int(cx, cy);
         SetupCommonBrushParams(kBrush, rect, center, r, isBrushMode);
         SetupCommonMasks(kBrush);
 
-        int tgx = (rw + 7) / 8; // 对应 [numthreads(8,8,1)] 的整除上取
+        int tgx = (rw + 7) / 8;
         int tgy = (rh + 7) / 8;
         csPaint.Dispatch(kBrush, Mathf.Max(1, tgx), Mathf.Max(1, tgy), 1);
     }
 
     private void GPU_DrawStrokeBetween(Vector2 uvA, Vector2 uvB, bool isBrushMode)
     {
+        if (!IsUVInside01(uvA) && !IsUVInside01(uvB)) return;
         Vector2 pA = new Vector2(uvA.x * (paintRT.width - 1), uvA.y * (paintRT.height - 1));
         Vector2 pB = new Vector2(uvB.x * (paintRT.width - 1), uvB.y * (paintRT.height - 1));
         float distPixels = Vector2.Distance(pA, pB);
-
-        // 优化长笔划采样间距（兼顾硬度）
         float spacing = Mathf.Max(1f, brushSize * (0.7f - 0.4f * brushHardness));
-
         int steps = Mathf.Max(1, Mathf.CeilToInt(distPixels / spacing));
         for (int i = 0; i <= steps; i++)
         {
@@ -692,11 +825,10 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
     }
 
-    // ====== GPU 调用：整岛填充/擦除 ======
     private void GPU_FillIsland(int islandId, bool isFill)
     {
         if (!computeReady || paintRT == null || baseRT == null) return;
-        if (islandIdBuffer == null || uvMaskBuffer == null) return; // 无连通域数据则跳过
+        if (islandIdBuffer == null || uvMaskBuffer == null) return;
 
         csPaint.SetTexture(kFillIsland, "_PaintRT", paintRT);
         csPaint.SetTexture(kFillIsland, "_BaseRT", baseRT);
@@ -704,24 +836,30 @@ public class LgcMeshUVColorPainter : EditorWindow
         SetupCommonFillParams(kFillIsland, islandId, isFill);
         SetupCommonMasks(kFillIsland);
 
-        int tgx = (paintRT.width + 15) / 16; // 对应 [numthreads(16,16,1)]
+        int tgx = (paintRT.width + 15) / 16;
         int tgy = (paintRT.height + 15) / 16;
         csPaint.Dispatch(kFillIsland, Mathf.Max(1, tgx), Mathf.Max(1, tgy), 1);
     }
 
-    // ====== 掩码缓冲就绪 ======
+    private static bool IsUVInside01(Vector2 uv) => uv.x >= 0f && uv.x <= 1f && uv.y >= 0f && uv.y <= 1f;
+
+    private Vector2 MirrorUVAcrossAxis(Vector2 p)
+    {
+        Vector2 a = symA; Vector2 b = symB; Vector2 ab = b - a; float len2 = ab.sqrMagnitude;
+        if (len2 < 1e-8f) return p;
+        float t = Vector2.Dot(p - a, ab) / len2; Vector2 proj = a + t * ab;
+        Vector2 mirrored = proj + (proj - p);
+        return mirrored;
+    }
+
     private bool EnsureMaskBuffersUpToDate()
     {
         if (paintRT == null) return false;
-
-        // 若无 Mesh 或无法生成掩码，则释放并返回 false
         if (targetMesh == null)
         {
             ReleaseMaskBuffers();
             return false;
         }
-
-        // CPU 构建（按需）
         RebuildUVCoverageMaskIfNeeded();
         RebuildIslandIdsIfNeeded();
 
@@ -733,7 +871,6 @@ public class LgcMeshUVColorPainter : EditorWindow
             return false;
         }
 
-        // GPU 上传（若尺寸变化或为空则重建）
         if (uvMaskBuffer == null ||
             islandIdBuffer == null ||
             uvMaskBuffer.count != paintRT.width * paintRT.height ||
@@ -744,7 +881,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         return (uvMaskBuffer != null && islandIdBuffer != null);
     }
 
-    // ====== UV覆盖与孤岛ID（CPU一次性构建） ======
     private void RebuildUVCoverageMaskIfNeeded()
     {
         if (paintRT == null || targetMesh == null)
@@ -811,7 +947,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         islandsCount = 0;
         if (uvMask == null) return;
 
-        // BFS 连通域标号
         Queue<int> q = new Queue<int>();
         for (int i = 0; i < uvMask.Length; i++)
         {
@@ -868,7 +1003,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         if (islandIdBuffer != null) { islandIdBuffer.Release(); islandIdBuffer = null; }
     }
 
-    // ====== 材质 & 资产 ======
     private void ApplyMaterialInstanceWithTexture(Texture tex)
     {
         if (targetRenderer == null || originalMaterialAsset == null) return;
@@ -884,7 +1018,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         else
         {
             instanceMat = new Material(originalMaterialAsset);
-            // 仍保留资源层面的 Undo（轻量）
             Undo.RegisterCreatedObjectUndo(instanceMat, "Create Material Instance");
             mats[selectedMatIndex] = instanceMat;
             targetRenderer.sharedMaterials = mats;
@@ -959,7 +1092,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         sourceMaterial = originalMaterialAsset;
     }
 
-    // ====== 输出/导出/定位/清空 ======
     private void SaveOutputOnly()
     {
         var L = EditorLanguageManager.Instance;
@@ -975,11 +1107,10 @@ public class LgcMeshUVColorPainter : EditorWindow
         infoType = MessageType.Info;
     }
 
-    // 读取 RT → 线性色彩空间纹理
     private Texture2D ReadRT_Linear(RenderTexture rt)
     {
         var prev = RenderTexture.active;
-        Texture2D texLinear = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false, true); // linear=true
+        Texture2D texLinear = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false, true);
         RenderTexture.active = rt;
         texLinear.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
         texLinear.Apply(false, false);
@@ -987,7 +1118,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         return texLinear;
     }
 
-    // 线性 → sRGB（仅在线性色彩空间时做转换）
     private Texture2D ToSRGBIfNeeded(Texture2D linearTex)
     {
         bool needGamma = QualitySettings.activeColorSpace == ColorSpace.Linear;
@@ -1036,19 +1166,17 @@ public class LgcMeshUVColorPainter : EditorWindow
         if (!AssetDatabase.IsValidFolder(folder)) CreateFoldersRecursively(folder);
         string layerPath = $"{folder}/{baseName}_绘制层.png";
 
-        // 若无基底图，则直接把当前结果当作笔触层导出（色彩校正）
         if (baseRT == null)
         {
             WriteRTToPng_ColorCorrect(paintRT, layerPath);
         }
         else
         {
-            // 在线性空间下进行差异计算，然后导出为 sRGB PNG
             Texture2D texBaseLin = ReadRT_Linear(baseRT);
             Texture2D texPaintLin = ReadRT_Linear(paintRT);
             int w = texPaintLin.width, h = texPaintLin.height;
-            Texture2D outLin = new Texture2D(w, h, TextureFormat.RGBA32, false, true); // linear
-            const float TH = 1f / 255f; // 透明阈值（<=1级差异视为无变更）
+            Texture2D outLin = new Texture2D(w, h, TextureFormat.RGBA32, false, true);
+            const float TH = 1f / 255f;
 
             for (int y = 0; y < h; y++)
             {
@@ -1060,14 +1188,8 @@ public class LgcMeshUVColorPainter : EditorWindow
                     float dg = Mathf.Abs(pp.g - pb.g);
                     float db = Mathf.Abs(pp.b - pb.b);
                     float a = Mathf.Max(dr, Mathf.Max(dg, db));
-                    if (a <= TH)
-                    {
-                        outLin.SetPixel(x, y, new Color(0, 0, 0, 0));
-                    }
-                    else
-                    {
-                        outLin.SetPixel(x, y, new Color(pp.r, pp.g, pp.b, Mathf.Clamp01(a)));
-                    }
+                    if (a <= TH) outLin.SetPixel(x, y, new Color(0, 0, 0, 0));
+                    else outLin.SetPixel(x, y, new Color(pp.r, pp.g, pp.b, Mathf.Clamp01(a)));
                 }
             }
             outLin.Apply(false, false);
@@ -1146,12 +1268,11 @@ public class LgcMeshUVColorPainter : EditorWindow
         BeginStrokeSnapshot();
         Graphics.Blit(baseRT, paintRT);
         EndStrokeApply(); _strokeActive = false;
-        infoMessage = "已清空改动"; // 简短提示
+        infoMessage = "已清空改动";
         infoType = MessageType.Info;
         Repaint();
     }
 
-    // ====== 工具方法 ======
     private RenderTexture NewRT(int w, int h)
     {
         var rt = new RenderTexture(w, h, 0, RTFormat, 0)
@@ -1161,7 +1282,7 @@ public class LgcMeshUVColorPainter : EditorWindow
             wrapMode = TextureWrapMode.Clamp
         };
 #if UNITY_2022_1_OR_NEWER
-        rt.graphicsFormat = GFormat; // 线性 UNorm，便于统一处理
+        rt.graphicsFormat = GFormat;
 #endif
         rt.Create();
         return rt;
@@ -1188,7 +1309,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
     }
 
-    // 统一使用画布分辨率的快照
     private RenderTexture GetSnapshotTarget()
     {
         return rtPool.Get(paintRT.width, paintRT.height);
@@ -1234,7 +1354,6 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     private void ResetView() { zoom = 1f; viewCenter = new Vector2(0.5f, 0.5f); }
 
-    // ====== —— 其余必要方法（来源于 v2.2.x/v2.3.x） —— ======
     private void LoadComputeIfNeeded()
     {
         if (computeReady && csPaint != null) return;
@@ -1298,7 +1417,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         if (sharedMats == null || sharedMats.Length == 0)
         {
             infoMessage = L.GetText("InfoNoMats"); infoType = MessageType.Info;
-            // 仍需构造 GPU 目标：默认透明 1024x1024
             SetupGPUTargets(null, 1024, 1024);
             UpdateDefaultOutputPath();
             return;
@@ -1361,7 +1479,6 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
         else
         {
-            // 无主纹理：生成空白
             SetupGPUTargets(null, 1024, 1024);
             UpdateDefaultOutputPath();
             bool existedBefore = AssetDatabase.LoadAssetAtPath<Object>(outputAssetPath) != null;
@@ -1376,11 +1493,8 @@ public class LgcMeshUVColorPainter : EditorWindow
     private void SetupGPUTargets(Texture srcTex, int w, int h)
     {
         ReleaseGPUResources();
-
         paintRT = NewRT(w, h);
         baseRT = NewRT(w, h);
-
-        // 把原图拷贝到 baseRT & paintRT；若无原图则置为透明
         if (srcTex != null)
         {
             var prev = RenderTexture.active;
@@ -1393,17 +1507,11 @@ public class LgcMeshUVColorPainter : EditorWindow
             ClearRT(baseRT, Color.clear);
             ClearRT(paintRT, Color.clear);
         }
-
-        // RW 状态
         if (!baseRT.enableRandomWrite) baseRT.enableRandomWrite = true; baseRT.Create();
         if (!paintRT.enableRandomWrite) paintRT.enableRandomWrite = true; paintRT.Create();
-
-        // 掩码
         RebuildUVCoverageMaskIfNeeded();
         RebuildIslandIdsIfNeeded();
         UploadMaskBuffers();
-
-        // Compute
         LoadComputeIfNeeded();
     }
 
@@ -1413,14 +1521,11 @@ public class LgcMeshUVColorPainter : EditorWindow
         RenderTexture shot = GetSnapshotTarget();
         Graphics.Blit(paintRT, shot);
         undoStack.Push(shot);
-
         while (undoStack.Count > UNDO_LIMIT)
         {
             var old = undoStack.ToArray().Last();
             if (old != null) { undoStack = new Stack<RenderTexture>(undoStack.Where(t => t != old)); rtPool.Return(old); break; }
         }
-
-        // 清空重做
         while (redoStack.Count > 0) { var r = redoStack.Pop(); if (r) rtPool.Return(r); }
     }
 
@@ -1435,11 +1540,9 @@ public class LgcMeshUVColorPainter : EditorWindow
         RenderTexture cur = GetSnapshotTarget();
         Graphics.Blit(paintRT, cur);
         redoStack.Push(cur);
-
         var prev = undoStack.Pop();
         Graphics.Blit(prev, paintRT);
         rtPool.Return(prev);
-
         if (enableRealTimePreview) ApplyMaterialInstanceWithTexture(paintRT);
         Repaint();
     }
@@ -1450,16 +1553,13 @@ public class LgcMeshUVColorPainter : EditorWindow
         RenderTexture cur = GetSnapshotTarget();
         Graphics.Blit(paintRT, cur);
         undoStack.Push(cur);
-
         var next = redoStack.Pop();
         Graphics.Blit(next, paintRT);
         rtPool.Return(next);
-
         if (enableRealTimePreview) ApplyMaterialInstanceWithTexture(paintRT);
         Repaint();
     }
 
-    // ====== 公共参数封装 ======
     private void SetupCommonMasks(int kernel)
     {
         bool maskAvailable = EnsureMaskBuffersUpToDate();
@@ -1468,12 +1568,10 @@ public class LgcMeshUVColorPainter : EditorWindow
             csPaint.SetBuffer(kernel, "_UvMask", uvMaskBuffer);
             csPaint.SetBuffer(kernel, "_IslandId", islandIdBuffer);
         }
-
         int enableBoundary = (uvBoundaryLimitEnabled && maskAvailable) ? 1 : 0;
         bool canIso = islandIsolationEnabled && maskAvailable && activeIslandId >= 0;
         int enableIsolation = canIso ? 1 : 0;
         int activeId = canIso ? activeIslandId : -1;
-
         csPaint.SetInt("_EnableBoundary", enableBoundary);
         csPaint.SetInt("_EnableIsolation", enableIsolation);
         csPaint.SetInt("_ActiveIslandId", activeId);
@@ -1502,5 +1600,5 @@ public class LgcMeshUVColorPainter : EditorWindow
 }
 #endif
 // ------------------------------
-// 底部版本行（copilote + LGC + v2.3.3）
+// 底部版本行（copilote + LGC + v2.4.1：对称编辑禁画 + 锚点放大自适应 + 光标反馈 + Foldout本地化）
 // ------------------------------
