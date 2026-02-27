@@ -1,0 +1,144 @@
+// LGCPaint.compute (fixed v2.0.2)
+// 变更摘要（v2.0.2）：
+// - 修复画笔/橡皮无效：KBrush 现在使用“局部线程坐标 + 矩形偏移”来寻址像素，
+//   不再直接把 SV_DispatchThreadID 当成全局像素坐标。
+//   当只调度局部区域时，旧实现会因未加偏移而全部越界早退，导致看似“无效”。
+// - 为局部调度加入边界裁剪：当线程落在 (w,h) 之外直接 return，避免越界。
+// - 保持孤岛填充/岛橡皮（KFillIsland）逻辑与接口不变。
+//
+// 与 C# v2.0.1 完全兼容；无需改 C#。
+
+#pragma kernel KBrush
+#pragma kernel KFillIsland
+
+// ====== RW / RO Texture ======
+RWTexture2D<float4> _PaintRT;
+Texture2D<float4>   _BaseRT;
+
+// ====== Buffers ======
+StructuredBuffer<int> _UvMask;      // 0 / 1
+StructuredBuffer<int> _IslandId;    // -1 / islandIndex
+
+// ====== Common ======
+int2  _TexSize;      // 纹理尺寸（像素）
+
+// ====== Brush params ======
+int4  _RectXYWH;     // 局部调度矩形：x,y,w,h（像素）
+int2  _Center;       // 画笔中心（像素，绝对坐标）
+int   _Radius;       // 半径（像素）
+float _Hardness;     // 0..1（硬边到软边）
+float4 _Color;       // 颜色（rgb用，a忽略）
+float _Opacity;      // 0..1（全局不透明度）
+int _Mode;           // 0 = brush, 1 = erase
+
+int _EnableBoundary;   // 1 时启用 UV 边界限制
+int _EnableIsolation;  // 1 时启用孤岛隔离
+int _ActiveIslandId;   // 当前锁定岛 ID（启用隔离时有效）
+
+// ====== Fill params ======
+int _FillIslandId;
+int _FillMode;       // 0 = fill, 1 = erase
+
+// ===========================================
+// KBrush (8x8) — 局部调度：线程坐标是“局部”，需加上偏移
+// ===========================================
+[numthreads(8,8,1)]
+void KBrush(uint3 id : SV_DispatchThreadID)
+{
+    // 局部线程坐标（相对于 _RectXYWH 左上角）：
+    uint2 lid = id.xy;
+
+    // 超出局部矩形尺寸则直接丢弃该线程（因为调度是向上取整）
+    if (lid.x >= (uint)_RectXYWH.z || lid.y >= (uint)_RectXYWH.w) return;
+
+    // 绝对像素坐标（添加偏移）
+    int x = _RectXYWH.x + (int)lid.x;
+    int y = _RectXYWH.y + (int)lid.y;
+
+    // 越界保护（理论上不应越界，但加入防御更稳）
+    if (x < 0 || y < 0 || x >= _TexSize.x || y >= _TexSize.y) return;
+
+    int idx = y * _TexSize.x + x;
+
+    // UV 边界
+    if (_EnableBoundary == 1 && _UvMask[idx] == 0) return;
+
+    // 孤岛隔离
+    if (_EnableIsolation == 1 && _ActiveIslandId >= 0)
+    {
+        if (_IslandId[idx] != _ActiveIslandId) return;
+    }
+
+    // 笔刷权重（距离 + 硬度）
+    float dx = (float)x - (float)_Center.x;
+    float dy = (float)y - (float)_Center.y;
+    float dist = sqrt(dx*dx + dy*dy);
+    if (dist > _Radius) return;
+
+    float w;
+    if (_Hardness >= 0.999)
+        w = 1.0;
+    else
+    {
+        float inner = (float)_Radius * _Hardness;
+        float t = saturate((dist - inner) / max(1e-5, ((float)_Radius - inner)));
+        w = 1.0 - t;
+    }
+
+    float a = saturate(_Opacity) * w;
+
+    float4 dst = _PaintRT[int2(x, y)];
+
+    if (_Mode == 0)
+    {
+        // 画笔
+        float4 src = float4(_Color.rgb, 1.0);
+        dst = lerp(dst, src, a);
+    }
+    else
+    {
+        // 橡皮（向基底过渡）
+        float4 baseC = _BaseRT[int2(x, y)];
+        dst = lerp(dst, baseC, a);
+    }
+
+    _PaintRT[int2(x, y)] = dst;
+}
+
+// ===========================================
+// KFillIsland (16x16) — 全域调度：线程即全局像素坐标
+// ===========================================
+[numthreads(16,16,1)]
+void KFillIsland(uint3 id : SV_DispatchThreadID)
+{
+    uint2 gid = id.xy;
+
+    if (gid.x >= (uint)_TexSize.x ||
+        gid.y >= (uint)_TexSize.y) return;
+
+    int x = (int)gid.x;
+    int y = (int)gid.y;
+    int idx = y * _TexSize.x + x;
+
+    if (_IslandId[idx] != _FillIslandId) return;
+
+    float a = saturate(_Opacity);
+
+    float4 dst = _PaintRT[int2(x, y)];
+    if (_FillMode == 0)
+    {
+        float4 src = float4(_Color.rgb, 1.0);
+        dst = lerp(dst, src, a);
+    }
+    else
+    {
+        float4 baseC = _BaseRT[int2(x, y)];
+        dst = lerp(dst, baseC, a);
+    }
+
+    _PaintRT[int2(x, y)] = dst;
+}
+
+// ------------------------------
+// 底部版本行（copilote + LGC + v2.0.2）
+// ------------------------------
