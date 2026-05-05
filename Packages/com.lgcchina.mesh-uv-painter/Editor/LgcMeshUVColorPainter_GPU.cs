@@ -2,11 +2,16 @@
 // LGC网格UV绘画工具（GPU版） - Unity 2022+
 // LgcMeshUVColorPainter_GPU.cs (v2.4.3)
 //
-// 本版（v2.4.3）更新：
+// 本版（v2.4.3-1）更新：
 // 1) 所有UI文本统一使用EditorLanguageManager.GetText()获取，移除硬编码文本
 // 2) 左侧工具栏增加各功能分类的Foldout折叠支持
 // 3) 【核心修复】解决实时预览材质在对象/材质切换时未正确还原的槽位错位问题
-//
+//临时增加修改
+//减少不必要的窗口更新
+//UV 线条坐标缓存	避免每帧重复计算
+//DrawLine → DrawLines + 去重	批量 GPU 操作，减少函数调用
+//缓存清理	优雅释放资源，防止内存泄漏
+//理论上性能会好一些
 // 说明：已模块化拆分 UV绘制/对称Gizmo/视图控制/笔刷参数/GPU执行
 using System;
 using System.Collections.Generic;
@@ -203,6 +208,7 @@ public class LgcMeshUVColorPainter : EditorWindow
         CleanupUnappliedOutputIfAny();
         ReleaseGPUResources();
         if (rtPool != null) rtPool.DisposeAll();
+        LgcMeshUVOverlayDrawer.ClearCache();
     }
 
     private void OnGUI()
@@ -509,12 +515,20 @@ public class LgcMeshUVColorPainter : EditorWindow
                                areaRect.y + (areaRect.height - previewH) * 0.5f,
                                previewW, previewH);
 
-        var e = Event.current; if (e != null)
+        var e = Event.current;
+        if (e != null)
         {
             bool hover = previewRect.Contains(e.mousePosition);
-            if (e.type == EventType.MouseMove || e.type == EventType.MouseEnterWindow || e.type == EventType.MouseLeaveWindow)
+            // ★【激进性能优化】只有当工具窗口有焦点 AND 鼠标在预览区时才 repaint
+            if (e.type == EventType.MouseMove)
             {
-                if (hover || e.type != EventType.MouseMove) Repaint();
+                if (hover && focusedWindow == this)
+                    Repaint();
+            }
+            // 窗口焦点变化时仍需要 repaint，保证界面正常
+            else if (e.type == EventType.MouseEnterWindow || e.type == EventType.MouseLeaveWindow)
+            {
+                Repaint();
             }
         }
 
