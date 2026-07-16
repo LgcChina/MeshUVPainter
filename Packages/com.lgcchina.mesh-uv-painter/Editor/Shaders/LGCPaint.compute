@@ -1,0 +1,266 @@
+#pragma kernel KBrush
+#pragma kernel KFillIsland
+#pragma kernel KComposite
+#pragma kernel KCompositeWhite
+#pragma kernel KStamp
+SamplerState sampler_LinearClamp;
+
+// ====== RW / RO Texture ======
+RWTexture2D<float4> _PaintLayerRT; // 绘制层 (RGBA, Alpha表示不透明度)
+Texture2D<float4> _BaseRT; // 原始基底（只读，用于合成）
+RWTexture2D<float4> _PreviewRT; // 合成显示图（用于显示和导出完整贴图）
+RWTexture2D<float4> _ResultRT; // 临时结果RT（用于白底合成）
+
+// ====== Buffers ======
+StructuredBuffer<int> _UvMask; // 0 / 1
+StructuredBuffer<int> _IslandId; // -1 / islandIndex
+
+// ====== Common ======
+int2 _TexSize;
+
+// ====== Brush params ======
+int4 _RectXYWH;
+int2 _Center;
+int _Radius;
+float _Hardness;
+float4 _Color;
+float _Opacity;
+int _Mode; // 0 = brush, 1 = erase
+
+int _EnableBoundary;
+int _EnableIsolation;
+int _ActiveIslandId;
+
+// ====== Fill params ======
+int _FillIslandId;
+int _FillMode; // 0 = fill, 1 = erase
+
+// ============================================================
+// 辅助函数：Porter-Duff Over 混合（用于绘制层）
+// ============================================================
+float4 BlendOver(float4 dst, float3 srcColor, float srcAlpha)
+{
+    // srcAlpha 已经包含了不透明度（例如笔刷的覆盖率）
+    float outAlpha = srcAlpha + dst.a * (1.0f - srcAlpha);
+    if (outAlpha < 1e-6f)
+        return float4(0, 0, 0, 0);
+
+    float3 outRGB = (srcColor * srcAlpha + dst.rgb * dst.a * (1.0f - srcAlpha)) / outAlpha;
+    return float4(outRGB, outAlpha);
+}
+
+// ============================================================
+// KBrush (8x8) —— 绘制层叠加 (Over)
+// ============================================================
+[numthreads(8, 8, 1)]
+void KBrush(uint3 id : SV_DispatchThreadID)
+{
+    uint2 lid = id.xy;
+    if (lid.x >= (uint) _RectXYWH.z || lid.y >= (uint) _RectXYWH.w)
+        return;
+
+    int x = _RectXYWH.x + (int) lid.x;
+    int y = _RectXYWH.y + (int) lid.y;
+    if (x < 0 || y < 0 || x >= _TexSize.x || y >= _TexSize.y)
+        return;
+
+    int idx = y * _TexSize.x + x;
+
+    if (_EnableBoundary == 1 && _UvMask[idx] == 0)
+        return;
+    if (_EnableIsolation == 1 && _ActiveIslandId >= 0 && _IslandId[idx] != _ActiveIslandId)
+        return;
+
+    // 抗锯齿权重
+    float px = (float) x + 0.5f;
+    float py = (float) y + 0.5f;
+    float dx = px - (float) _Center.x;
+    float dy = py - (float) _Center.y;
+    float dist = sqrt(dx * dx + dy * dy);
+
+    float radius = (float) _Radius;
+    float inner = radius * saturate(_Hardness);
+    float edgeWidth = max(1.0f, radius - inner);
+
+    float weight = 1.0f - smoothstep(inner, inner + edgeWidth, dist);
+    if (weight <= 0.0f)
+        return;
+
+    float a = saturate(_Opacity) * weight;
+    float4 dst = _PaintLayerRT[int2(x, y)];
+
+    if (_Mode == 0) // 画笔 —— Over 合成到绘制层
+    {
+        dst = BlendOver(dst, _Color.rgb, a);
+    }
+    else // 橡皮擦 —— 减少不透明度
+    {
+        dst.a *= (1.0f - a);
+        // 如果透明度接近0，清除颜色残留
+        if (dst.a < 0.001f)
+            dst = float4(0, 0, 0, 0);
+    }
+
+    _PaintLayerRT[int2(x, y)] = dst;
+}
+
+// ============================================================
+// KFillIsland (16x16) —— 同样使用 BlendOver
+// ============================================================
+[numthreads(16, 16, 1)]
+void KFillIsland(uint3 id : SV_DispatchThreadID)
+{
+    uint2 gid = id.xy;
+    if (gid.x >= (uint) _TexSize.x || gid.y >= (uint) _TexSize.y)
+        return;
+
+    int x = (int) gid.x;
+    int y = (int) gid.y;
+
+    int idx = y * _TexSize.x + x;
+    if (_IslandId[idx] != _FillIslandId)
+        return;
+
+    float a = saturate(_Opacity);
+    float4 dst = _PaintLayerRT[int2(x, y)];
+
+    if (_FillMode == 0) // 填充
+    {
+        dst = BlendOver(dst, _Color.rgb, a);
+    }
+    else // 填充式擦除
+    {
+        dst.a *= (1.0f - a);
+        if (dst.a < 0.001f)
+            dst = float4(0, 0, 0, 0);
+    }
+
+    _PaintLayerRT[int2(x, y)] = dst;
+}
+
+// ============================================================
+// KComposite —— 合成 preview = paintLayer over base
+// ============================================================
+[numthreads(16, 16, 1)]
+void KComposite(uint3 id : SV_DispatchThreadID)
+{
+    uint2 gid = id.xy;
+    if (gid.x >= (uint) _TexSize.x || gid.y >= (uint) _TexSize.y)
+        return;
+
+    int x = (int) gid.x;
+    int y = (int) gid.y;
+
+    float4 base = _BaseRT[int2(x, y)];
+    float4 layer = _PaintLayerRT[int2(x, y)];
+
+    float alpha = layer.a;
+    float3 result = layer.rgb * alpha + base.rgb * (1.0f - alpha);
+    _PreviewRT[int2(x, y)] = float4(result, 1.0f);
+}
+
+// ============================================================
+// KCompositeWhite —— 合成白底 (用于导出白底绘制层)
+// ============================================================
+[numthreads(16, 16, 1)]
+void KCompositeWhite(uint3 id : SV_DispatchThreadID)
+{
+    uint2 gid = id.xy;
+    if (gid.x >= (uint) _TexSize.x || gid.y >= (uint) _TexSize.y)
+        return;
+
+    int x = (int) gid.x;
+    int y = (int) gid.y;
+
+    float4 layer = _PaintLayerRT[int2(x, y)];
+
+    float alpha = layer.a;
+    float3 result = layer.rgb * alpha + (1.0f - alpha); // white = (1,1,1)
+    _ResultRT[int2(x, y)] = float4(result, 1.0f);
+}
+
+// ============================================================
+// KStamp (16x16) —— 盖印图案（支持宽高比、UV边界、孤岛隔离、镜像）
+// ============================================================
+Texture2D<float4> _StampTex;
+float2 _StampTexSize;
+
+int4 _StampRect; // x, y, w, h (像素坐标)
+float2 _StampCenter; // UV 中心 (0~1)
+float _StampScale;
+float _StampRotation; // 弧度
+float _StampOpacity;
+float _StampMirror; // ★ 1.0 = 水平翻转, 0.0 = 正常
+
+[numthreads(16, 16, 1)]
+void KStamp(uint3 id : SV_DispatchThreadID)
+{
+    uint2 lid = id.xy;
+    if (lid.x >= (uint) _StampRect.z || lid.y >= (uint) _StampRect.w)
+        return;
+
+    int x = _StampRect.x + (int) lid.x;
+    int y = _StampRect.y + (int) lid.y;
+    if (x < 0 || y < 0 || x >= _TexSize.x || y >= _TexSize.y)
+        return;
+
+    // 像素中心采样
+    float2 uv = float2(
+        ((float) x + 0.5f) / _TexSize.x,
+        ((float) y + 0.5f) / _TexSize.y
+    );
+
+    // UV 边界限制
+    int idx = y * _TexSize.x + x;
+    if (_EnableBoundary == 1 && _UvMask[idx] == 0)
+        return;
+
+    // 孤岛隔离
+    if (_EnableIsolation == 1 && _ActiveIslandId >= 0)
+    {
+        if (_IslandId[idx] != _ActiveIslandId)
+            return;
+    }
+
+    // 相对于中心的偏移
+    float2 offset = uv - _StampCenter;
+
+    // 反旋转
+    float cosA = cos(_StampRotation);
+    float sinA = sin(_StampRotation);
+    float2 rotated = float2(
+        offset.x * cosA + offset.y * sinA,
+        -offset.x * sinA + offset.y * cosA
+    );
+
+    // 宽高比修正
+    float aspect = _StampTexSize.x / _StampTexSize.y;
+    float invScale = 1.0f / max(_StampScale, 0.001f);
+    float2 stampUV = float2(
+        rotated.x * invScale / aspect,
+        rotated.y * invScale
+    ) + 0.5f;
+
+    // ★ 应用水平翻转（镜像）
+    if (_StampMirror > 0.5f)
+    {
+        stampUV.x = 1.0f - stampUV.x;
+    }
+
+    // 纹理坐标裁剪
+    if (stampUV.x < 0 || stampUV.x > 1 || stampUV.y < 0 || stampUV.y > 1)
+        return;
+
+    // 采样图案
+    float4 stampColor = _StampTex.SampleLevel(sampler_LinearClamp, stampUV, 0);
+
+    // 透明度阈值
+    float alpha = stampColor.a * _StampOpacity;
+    if (alpha < 0.005f)
+        return;
+
+    // 叠加到绘制层
+    float4 dst = _PaintLayerRT[int2(x, y)];
+    dst = BlendOver(dst, stampColor.rgb, alpha);
+    _PaintLayerRT[int2(x, y)] = dst;
+}
