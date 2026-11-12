@@ -3,7 +3,7 @@ using UnityEditor;
 using UnityEngine;
 
 /// <summary>
-/// LGC - Mesh UV Overlay Drawer
+/// LGC - Mesh UV Overlay Drawer (v2.7.0)
 /// 修复版：正确处理坐标空间
 /// </summary>
 internal static class LgcMeshUVOverlayDrawer
@@ -14,7 +14,10 @@ internal static class LgcMeshUVOverlayDrawer
         public Mesh cachedMesh;
         public Rect cachedViewRect;
         public Rect cachedPreviewRect;
-        public Vector3[] linePoints;          // 本地坐标（相对于previewRect的左上角）
+        public int[] cachedActiveTriangles;
+        public int[] cachedInactiveTriangles;
+        public Vector3[] activeLinePoints;    // 当前材质组
+        public Vector3[] inactiveLinePoints;  // 全部子网格模式下弱化显示
         public bool valid = false;
     }
 
@@ -24,27 +27,32 @@ internal static class LgcMeshUVOverlayDrawer
         Rect previewRect,
         Rect viewRect,
         Mesh mesh,
+        int[] activeTriangles,
+        int[] inactiveTriangles,
         Color lineColor,
         float alpha)
     {
         if (mesh == null) return;
 
         var uvs = mesh.uv;
-        var tris = mesh.triangles;
 
-        if (uvs == null || uvs.Length == 0 || tris == null || tris.Length == 0)
+        if (uvs == null || uvs.Length == 0 ||
+            (activeTriangles == null || activeTriangles.Length == 0) &&
+            (inactiveTriangles == null || inactiveTriangles.Length == 0))
             return;
 
         // ★ 检查缓存是否有效
         bool cacheValid = cache.valid &&
                          cache.cachedMesh == mesh &&
                          RectEquals(cache.cachedViewRect, viewRect) &&
-                         RectEquals(cache.cachedPreviewRect, previewRect);
+                         RectEquals(cache.cachedPreviewRect, previewRect) &&
+                         object.ReferenceEquals(cache.cachedActiveTriangles, activeTriangles) &&
+                         object.ReferenceEquals(cache.cachedInactiveTriangles, inactiveTriangles);
 
         // ★ 如果缓存无效，重建
         if (!cacheValid)
         {
-            RebuildCache(mesh, uvs, tris, previewRect, viewRect);
+            RebuildCache(mesh, uvs, activeTriangles, inactiveTriangles, previewRect, viewRect);
         }
 
         // ★ 用 Handles.DrawLines 批量绘制
@@ -54,70 +62,63 @@ internal static class LgcMeshUVOverlayDrawer
     /// <summary>
     /// 重建坐标缓存
     /// </summary>
-    private static void RebuildCache(Mesh mesh, Vector2[] uvs, int[] tris,
+    private static void RebuildCache(Mesh mesh, Vector2[] uvs,
+                                     int[] activeTriangles,
+                                     int[] inactiveTriangles,
                                      Rect previewRect, Rect viewRect)
     {
         float w = previewRect.width;
         float h = previewRect.height;
 
-        System.Collections.Generic.List<Vector3> points =
-            new System.Collections.Generic.List<Vector3>(uvs.Length);
-        System.Collections.Generic.Dictionary<int, int> vertexIndexMap =
-            new System.Collections.Generic.Dictionary<int, int>();
+        Vector3[] points = new Vector3[uvs.Length];
+        bool[] pointReady = new bool[uvs.Length];
 
-        // ★ 去重：同一个UV顶点只计算一次
-        for (int i = 0; i < tris.Length; i++)
+        Vector3 GetPoint(int vertexIndex)
         {
-            int triIdx = tris[i];
-            if (triIdx < 0 || triIdx >= uvs.Length)
-                continue;
-
-            if (!vertexIndexMap.ContainsKey(triIdx))
+            if (!pointReady[vertexIndex])
             {
-                Vector2 uv = uvs[triIdx];
+                Vector2 uv = uvs[vertexIndex];
                 float nx = (uv.x - viewRect.xMin) / Mathf.Max(1e-6f, viewRect.width);
                 float ny = (uv.y - viewRect.yMin) / Mathf.Max(1e-6f, viewRect.height);
-
-                // ★ 坐标计算在本地空间（相对于previewRect的左上角）
-                points.Add(new Vector3(nx * w, (1f - ny) * h, 0f));
-                vertexIndexMap[triIdx] = points.Count - 1;
+                points[vertexIndex] = new Vector3(nx * w, (1f - ny) * h, 0f);
+                pointReady[vertexIndex] = true;
             }
+            return points[vertexIndex];
         }
 
-        // ★ 构建线段顶点数组
-        System.Collections.Generic.List<Vector3> lineVertices =
-            new System.Collections.Generic.List<Vector3>();
-
-        for (int i = 0; i < tris.Length; i += 3)
+        Vector3[] BuildLines(int[] tris)
         {
-            int i0 = tris[i];
-            int i1 = tris[i + 1];
-            int i2 = tris[i + 2];
+            if (tris == null || tris.Length < 3) return System.Array.Empty<Vector3>();
+            System.Collections.Generic.List<Vector3> lineVertices =
+                new System.Collections.Generic.List<Vector3>((tris.Length / 3) * 6);
 
-            if (i0 < 0 || i1 < 0 || i2 < 0 ||
-                i0 >= uvs.Length || i1 >= uvs.Length || i2 >= uvs.Length)
-                continue;
+            for (int i = 0; i + 2 < tris.Length; i += 3)
+            {
+                int i0 = tris[i];
+                int i1 = tris[i + 1];
+                int i2 = tris[i + 2];
+                if (i0 < 0 || i1 < 0 || i2 < 0 ||
+                    i0 >= uvs.Length || i1 >= uvs.Length || i2 >= uvs.Length)
+                    continue;
 
-            int pi0 = vertexIndexMap[i0];
-            int pi1 = vertexIndexMap[i1];
-            int pi2 = vertexIndexMap[i2];
-
-            // 三条边
-            lineVertices.Add(points[pi0]);
-            lineVertices.Add(points[pi1]);
-
-            lineVertices.Add(points[pi1]);
-            lineVertices.Add(points[pi2]);
-
-            lineVertices.Add(points[pi2]);
-            lineVertices.Add(points[pi0]);
+                Vector3 p0 = GetPoint(i0);
+                Vector3 p1 = GetPoint(i1);
+                Vector3 p2 = GetPoint(i2);
+                lineVertices.Add(p0); lineVertices.Add(p1);
+                lineVertices.Add(p1); lineVertices.Add(p2);
+                lineVertices.Add(p2); lineVertices.Add(p0);
+            }
+            return lineVertices.ToArray();
         }
 
         // ★ 更新缓存
         cache.cachedMesh = mesh;
         cache.cachedViewRect = viewRect;
         cache.cachedPreviewRect = previewRect;
-        cache.linePoints = lineVertices.ToArray();
+        cache.cachedActiveTriangles = activeTriangles;
+        cache.cachedInactiveTriangles = inactiveTriangles;
+        cache.activeLinePoints = BuildLines(activeTriangles);
+        cache.inactiveLinePoints = BuildLines(inactiveTriangles);
         cache.valid = true;
     }
 
@@ -126,16 +127,26 @@ internal static class LgcMeshUVOverlayDrawer
     /// </summary>
     private static void DrawCachedLines(Rect previewRect, Color lineColor, float alpha)
     {
-        if (!cache.valid || cache.linePoints == null || cache.linePoints.Length == 0)
+        if (!cache.valid)
             return;
 
         Handles.BeginGUI();
-        Handles.color = new Color(lineColor.r, lineColor.g, lineColor.b, Mathf.Clamp01(alpha));
-
         GUI.BeginClip(previewRect);
 
         // GUI.BeginClip已经做了坐标系变换，坐标原点现在是previewRect的左上角
-        Handles.DrawLines(cache.linePoints);
+        if (cache.inactiveLinePoints != null && cache.inactiveLinePoints.Length > 0)
+        {
+            Color inactive = lineColor;
+            inactive.a = Mathf.Clamp01(alpha) * 0.22f;
+            Handles.color = inactive;
+            Handles.DrawLines(cache.inactiveLinePoints);
+        }
+
+        if (cache.activeLinePoints != null && cache.activeLinePoints.Length > 0)
+        {
+            Handles.color = new Color(lineColor.r, lineColor.g, lineColor.b, Mathf.Clamp01(alpha));
+            Handles.DrawLines(cache.activeLinePoints);
+        }
 
         GUI.EndClip();
         Handles.EndGUI();
@@ -158,7 +169,11 @@ internal static class LgcMeshUVOverlayDrawer
     public static void ClearCache()
     {
         cache.valid = false;
-        cache.linePoints = null;
+        cache.cachedMesh = null;
+        cache.cachedActiveTriangles = null;
+        cache.cachedInactiveTriangles = null;
+        cache.activeLinePoints = null;
+        cache.inactiveLinePoints = null;
     }
 }
 #endif

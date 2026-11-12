@@ -1,6 +1,9 @@
 #if UNITY_EDITOR
 // LGC网格UV绘画工具（GPU版） - Unity 2022+
-// LgcMeshUVColorPainter_GPU.cs (v2.6.0)
+// LgcMeshUVColorPainter_GPU.cs (v2.7.0)
+// 【材质组 UV 作用域】
+// - UV 叠加、边界遮罩与孤岛按当前材质组生成
+// - 支持全部子网格只读查看模式
 // 【自定义图案盖印系统】
 // - 新增 Stamp 模式，与画笔模式分离
 // - 图章跟随UV缩放，可拖拽裁剪
@@ -17,7 +20,7 @@ using Object = UnityEngine.Object;
 
 public class LgcMeshUVColorPainter : EditorWindow
 {
-    internal const string VERSION = "v2.6.0";
+    internal const string VERSION = "v2.7.0";
     public static string VersionString => VERSION;
     private const string LOG_PREFIX = "[LGC网格UV绘画工具(GPU)] ";
 
@@ -80,9 +83,15 @@ public class LgcMeshUVColorPainter : EditorWindow
     private bool showUVOverlay = true;
     private Color uvColor = new Color(0.65f, 0.65f, 0.65f, 1f);
     private float uvAlpha = 0.85f;
+    [SerializeField] private UVOverlayScope uvOverlayScope = UVOverlayScope.CurrentMaterialGroup;
+    private int[] activeMaterialTriangles;
+    private int[] inactiveUvTriangles;
+    private bool materialUvScopeDirty = true;
+    private bool sharedAtlasDetected = false;
 
     // ★ 新增 Stamp 模式
     private enum PaintMode { Brush, Erase, Fill, IslandErase, Stamp }
+    private enum UVOverlayScope { CurrentMaterialGroup, AllSubMeshes }
     private PaintMode mode = PaintMode.Brush;
 
     private bool uvBoundaryLimitEnabled = true;
@@ -507,8 +516,28 @@ public class LgcMeshUVColorPainter : EditorWindow
         {
             EditorGUI.indentLevel++;
             showUVOverlay = EditorGUILayout.Toggle(L.GetText("ShowUVOverlay"), showUVOverlay);
+            string[] scopeNames =
+            {
+                L.GetText("UVScopeCurrentMaterial"),
+                L.GetText("UVScopeAllSubMeshes")
+            };
+            int newScope = EditorGUILayout.Popup(
+                L.GetText("UVDisplayScope"),
+                (int)uvOverlayScope,
+                scopeNames);
+            if (newScope != (int)uvOverlayScope)
+            {
+                uvOverlayScope = (UVOverlayScope)newScope;
+                RefreshUVScopeDataIfNeeded(true);
+                LgcMeshUVOverlayDrawer.ClearCache();
+                Repaint();
+            }
             uvColor = EditorGUILayout.ColorField(L.GetText("UVLineColor"), uvColor);
             uvAlpha = EditorGUILayout.Slider(L.GetText("UVOverlayStrength"), uvAlpha, 0f, 1f);
+            if (uvOverlayScope == UVOverlayScope.AllSubMeshes)
+                EditorGUILayout.HelpBox(L.GetText("UVScopeAllHint"), MessageType.Info);
+            if (sharedAtlasDetected)
+                EditorGUILayout.HelpBox(L.GetText("UVSharedTextureWarning"), MessageType.Warning);
             EditorGUI.indentLevel--;
         }
 
@@ -636,7 +665,20 @@ public class LgcMeshUVColorPainter : EditorWindow
             new Rect(viewRect.xMin, viewRect.yMin, viewRect.width, viewRect.height));
 
         if (showUVOverlay && targetMesh != null)
-            LgcMeshUVOverlayDrawer.DrawUVOverlay(previewRect, viewRect, targetMesh, uvColor, uvAlpha);
+        {
+            RefreshUVScopeDataIfNeeded();
+            int[] inactiveTris = uvOverlayScope == UVOverlayScope.AllSubMeshes
+                ? inactiveUvTriangles
+                : null;
+            LgcMeshUVOverlayDrawer.DrawUVOverlay(
+                previewRect,
+                viewRect,
+                targetMesh,
+                activeMaterialTriangles,
+                inactiveTris,
+                uvColor,
+                uvAlpha);
+        }
 
         if (symmetryEnabled)
             symmetryController.DrawAndHandle(previewRect, viewRect, symmetryLocked, viewController.Zoom, true);
@@ -861,7 +903,9 @@ public class LgcMeshUVColorPainter : EditorWindow
         maskW = paintLayerRT.width; maskH = paintLayerRT.height;
         uvMask = new int[maskW * maskH];
 
-        var uvs = targetMesh.uv; var tris = targetMesh.triangles;
+        RefreshUVScopeDataIfNeeded();
+        var uvs = targetMesh.uv;
+        var tris = activeMaterialTriangles;
         if (uvs == null || uvs.Length == 0 || tris == null || tris.Length == 0)
         {
             islandIdMask = null; islandsCount = 0; uvMaskDirty = false; islandsDirty = false; return;
@@ -1714,6 +1758,11 @@ public class LgcMeshUVColorPainter : EditorWindow
         appliedToOutput = false;
         viewController.ResetView();
         uvMaskDirty = true; islandsDirty = true; activeIslandId = -1;
+        activeMaterialTriangles = null;
+        inactiveUvTriangles = null;
+        materialUvScopeDirty = true;
+        sharedAtlasDetected = false;
+        LgcMeshUVOverlayDrawer.ClearCache();
         ClearUndoStacks();
 
         if (obj == null) { infoMessage = L.GetText("InfoWelcome"); infoType = MessageType.Info; return; }
@@ -1753,6 +1802,9 @@ public class LgcMeshUVColorPainter : EditorWindow
         originalTexture = null; originalAssetPath = null;
         outputAssetPath = null; outputCreatedInSession = false;
         uvMaskDirty = true; islandsDirty = true; activeIslandId = -1;
+        materialUvScopeDirty = true;
+        sharedAtlasDetected = false;
+        LgcMeshUVOverlayDrawer.ClearCache();
         ClearUndoStacks();
 
         if (sharedMats == null || sharedMats.Length == 0 || selectedMatIndex < 0 || selectedMatIndex >= sharedMats.Length)
@@ -1774,6 +1826,8 @@ public class LgcMeshUVColorPainter : EditorWindow
 
         sourceMaterial = originalMaterialAsset;
         mainTexPropName = FindMainTexturePropertyName(sourceMaterial);
+        RefreshUVScopeDataIfNeeded(true);
+        RefreshSharedTextureConflict();
 
         Texture tex = null;
         if (!string.IsNullOrEmpty(mainTexPropName))
@@ -1819,6 +1873,101 @@ public class LgcMeshUVColorPainter : EditorWindow
         MarkPreviewDirty();
         EnsurePreview();
         Repaint();
+    }
+
+    private void RefreshUVScopeDataIfNeeded(bool force = false)
+    {
+        if (!force && !materialUvScopeDirty) return;
+
+        var activeTriangles = new List<int>();
+        var inactiveTriangles = new List<int>();
+
+        if (targetMesh != null &&
+            sharedMats != null &&
+            sharedMats.Length > 0 &&
+            selectedMatIndex >= 0 &&
+            selectedMatIndex < sharedMats.Length)
+        {
+            Material activeMaterial = sharedMats[selectedMatIndex];
+            int subMeshCount = Mathf.Min(targetMesh.subMeshCount, sharedMats.Length);
+
+            if (activeMaterial != null)
+            {
+                for (int subMeshIndex = 0; subMeshIndex < subMeshCount; subMeshIndex++)
+                {
+                    int[] subMeshTriangles = targetMesh.GetTriangles(subMeshIndex);
+                    if (sharedMats[subMeshIndex] == activeMaterial)
+                        activeTriangles.AddRange(subMeshTriangles);
+                    else
+                        inactiveTriangles.AddRange(subMeshTriangles);
+                }
+            }
+        }
+
+        activeMaterialTriangles = activeTriangles.ToArray();
+        inactiveUvTriangles = inactiveTriangles.ToArray();
+        materialUvScopeDirty = false;
+        uvMaskDirty = true;
+        islandsDirty = true;
+        LgcMeshUVOverlayDrawer.ClearCache();
+    }
+
+    private void RefreshSharedTextureConflict()
+    {
+        sharedAtlasDetected = false;
+
+        if (targetMesh == null ||
+            sharedMats == null ||
+            sharedMats.Length == 0 ||
+            selectedMatIndex < 0 ||
+            selectedMatIndex >= sharedMats.Length)
+            return;
+
+        Material selectedMaterial = sharedMats[selectedMatIndex];
+        if (selectedMaterial == null) return;
+
+        Texture selectedTexture = GetMainTexture(selectedMaterial, true);
+        if (selectedTexture == null) return;
+
+        int subMeshCount = Mathf.Min(targetMesh.subMeshCount, sharedMats.Length);
+        for (int subMeshIndex = 0; subMeshIndex < subMeshCount; subMeshIndex++)
+        {
+            if (subMeshIndex == selectedMatIndex) continue;
+
+            Material otherMaterial = sharedMats[subMeshIndex];
+            if (otherMaterial == null || otherMaterial == selectedMaterial) continue;
+
+            Texture otherTexture = GetMainTexture(otherMaterial, false);
+            if (SameTextureAsset(selectedTexture, otherTexture))
+            {
+                sharedAtlasDetected = true;
+                return;
+            }
+        }
+
+        Texture GetMainTexture(Material material, bool preferSelectedProperty)
+        {
+            string propertyName = preferSelectedProperty
+                ? mainTexPropName
+                : FindMainTexturePropertyName(material);
+
+            Texture texture = null;
+            if (!string.IsNullOrEmpty(propertyName) && material.HasProperty(propertyName))
+                texture = material.GetTexture(propertyName);
+            if (texture == null)
+                texture = material.mainTexture;
+            return texture;
+        }
+
+        static bool SameTextureAsset(Texture first, Texture second)
+        {
+            if (first == null || second == null) return false;
+            if (first == second) return true;
+
+            string firstPath = AssetDatabase.GetAssetPath(first);
+            string secondPath = AssetDatabase.GetAssetPath(second);
+            return !string.IsNullOrEmpty(firstPath) && firstPath == secondPath;
+        }
     }
 
     #endregion

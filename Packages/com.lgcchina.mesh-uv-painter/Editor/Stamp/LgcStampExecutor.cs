@@ -2,7 +2,7 @@
 using UnityEngine;
 
 /// <summary>
-/// LGC - 盖印图案执行器 (v2.6.0)
+/// LGC - 盖印图案执行器 (v2.7.0)
 /// 支持 UV 边界限制、孤岛隔离、图案镜像
 /// </summary>
 internal class LgcStampExecutor

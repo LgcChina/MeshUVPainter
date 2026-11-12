@@ -5,7 +5,7 @@ using UnityEngine;
 /// <summary>
 /// LGC - 对称 Gizmo 控制器
 /// 负责对称线的绘制、拖拽，以及 UV 镜像计算
-/// v2.6.0: 增加 GUI.BeginClip(previewRect) 裁剪，防止绘制超出预览区
+/// v2.7.0: 增加 GUI.BeginClip(previewRect) 裁剪，防止绘制超出预览区
 /// </summary>
 internal class LgcSymmetryGizmoController
 {

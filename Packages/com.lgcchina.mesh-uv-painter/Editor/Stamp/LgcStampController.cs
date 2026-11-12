@@ -3,7 +3,7 @@ using UnityEditor;
 using UnityEngine;
 
 /// <summary>
-/// LGC - 盖印图案控制器 (v2.6.0)
+/// LGC - 盖印图案控制器 (v2.7.0)
 /// 支持：移动/旋转/缩放/删除，对称预览，图案镜像预览
 /// </summary>
 internal class LgcStampController

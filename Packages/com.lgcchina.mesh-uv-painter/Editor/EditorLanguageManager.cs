@@ -223,6 +223,21 @@ public sealed class EditorLanguageManager
         _zh["UVOverlayStrength"] = "UV叠加强度";
         _ja["UVOverlayStrength"] = "UVオーバーレイ強度";
         _en["UVOverlayStrength"] = "UV Overlay Strength";
+        _zh["UVDisplayScope"] = "UV显示范围";
+        _ja["UVDisplayScope"] = "UV表示範囲";
+        _en["UVDisplayScope"] = "UV Display Scope";
+        _zh["UVScopeCurrentMaterial"] = "当前材质组";
+        _ja["UVScopeCurrentMaterial"] = "現在のマテリアル";
+        _en["UVScopeCurrentMaterial"] = "Current Material Group";
+        _zh["UVScopeAllSubMeshes"] = "全部子网格（仅查看）";
+        _ja["UVScopeAllSubMeshes"] = "全サブメッシュ（表示のみ）";
+        _en["UVScopeAllSubMeshes"] = "All Sub Meshes (View Only)";
+        _zh["UVScopeAllHint"] = "其他材质 UV 仅弱化显示，绘制仍限制在当前材质组。";
+        _ja["UVScopeAllHint"] = "他のマテリアルのUVは薄く表示され、描画は現在のマテリアルに制限されます。";
+        _en["UVScopeAllHint"] = "Other material UVs are dimmed for reference; painting remains limited to the current material group.";
+        _zh["UVSharedTextureWarning"] = "多个材质共用同一主贴图；重叠 UV 区域可能互相影响，建议按材质拆分贴图。";
+        _ja["UVSharedTextureWarning"] = "複数のマテリアルが同じメインテクスチャを共有しています。重なるUV領域が互いに影響する可能性があるため、マテリアル別のテクスチャ分割を推奨します。";
+        _en["UVSharedTextureWarning"] = "Multiple materials share the same main texture. Overlapping UV areas may affect each other; splitting the texture by material is recommended.";
 
         // 保存/导出/定位
         _zh["GroupApplySaveLocate"] = "实时预览 / 保存 / 清空 / 定位";
@@ -375,7 +390,11 @@ public sealed class EditorLanguageManager
     "- 提供 UV 边界限制与孤岛隔离模式，使绘制更精准安全。\n" +
     "- 所有操作支持 Undo/Redo，实时预览不修改原材质。\n" +
     "- 输出目录统一管理，可快速定位导出贴图。\n\n" +
-    "v2.5.1 新增及改进\n" +
+    "v2.7.0 新增及改进\n" +
+    "- 【材质 UV 范围】默认只显示并绘制当前材质组；同一材质映射多个子网格时自动合并，不再混入身体、眼睛等其他材质 UV。\n" +
+    "- 【查看模式】新增“全部子网格（仅查看）”，其他材质 UV 弱化显示，绘制、边界遮罩和孤岛识别仍限定当前材质组。\n" +
+    "- 【风险提示】多个材质共用同一主贴图时提示重叠 UV 风险，建议按材质拆分贴图。\n\n" +
+    "v2.5.1 历史改进\n" +
     "- 【架构升级】三RT架构（baseRT + paintLayerRT + previewRT），绘制层独立存储，彻底解决颜色泄漏与透明导出偏色问题。\n" +
     "- 【导出增强】透明层直接导出绘制层，白底导出通过 GPU 合成，颜色纯净，支持叠加白底选项。\n" +
     "- 【交互优化】边界扩展使用延迟输入（回车后应用），避免数值调整时频繁重建；对称线增加裁剪，防止绘制到工具栏区域。\n" +
@@ -388,7 +407,11 @@ public sealed class EditorLanguageManager
     "- UV境界拘束とアイランド分離モードにより、より正確で安全なペイントが可能になります。\n" +
     "- すべての操作で元に戻す/やり直しが可能になり、元のマテリアルを変更することなくリアルタイムプレビューが可能です。\n" +
     "- 出力ディレクトリ管理を統合し、エクスポートしたテクスチャを素早く見つけられるようになりました。\n\n" +
-    "v2.5.1 新機能と改善\n" +
+    "v2.7.0 新機能と改善\n" +
+    "- 【マテリアルUV範囲】既定では現在のマテリアルグループのみを表示・描画します。同じマテリアルが複数のサブメッシュにある場合は自動統合され、ボディや目のUVは混在しません。\n" +
+    "- 【表示モード】「全サブメッシュ（表示のみ）」を追加しました。他のマテリアルUVは薄く表示され、描画・境界マスク・アイランド認識は現在のマテリアルに限定されます。\n" +
+    "- 【リスク表示】複数マテリアルが同じメインテクスチャを共有する場合にUV重複リスクを表示し、マテリアル別のテクスチャ分割を推奨します。\n\n" +
+    "v2.5.1 過去の改善\n" +
     "- 【アーキテクチャアップグレード】三RTアーキテクチャ（baseRT + paintLayerRT + previewRT）により、描画レイヤーを独立して保存し、色漏れや透明出力の色ずれを完全に解消しました。\n" +
     "- 【出力強化】透明レイヤーは描画レイヤーを直接出力、白背景出力はGPU合成により色が純粋になり、白背景オプションをサポートします。\n" +
     "- 【インタラクション改善】境界拡張は遅延入力（Enterで適用）を使用し、数値調整時の頻繁な再構築を回避；対称線にクリッピングを追加し、ツールバー領域への描画を防止します。\n" +
@@ -401,7 +424,11 @@ public sealed class EditorLanguageManager
     "- Provides UV boundary constraints and island isolation modes for more precise and safer painting.\n" +
     "- All operations support Undo/Redo, with real-time preview without modifying original materials.\n" +
     "- Unified output directory management for quick location of exported textures.\n\n" +
-    "v2.5.1 New & Improved\n" +
+    "v2.7.0 New & Improved\n" +
+    "- 【Material UV Scope】Only the current material group is shown and painted by default. Sub-meshes using the same material are merged automatically, preventing body and eye UVs from mixing.\n" +
+    "- 【View Mode】Added All Sub Meshes (View Only). Other material UVs are dimmed for reference; painting, boundary masks, and island detection stay limited to the current material group.\n" +
+    "- 【Risk Warning】Warns when multiple materials share the same main texture and recommends splitting textures by material.\n\n" +
+    "v2.5.1 Historical Improvements\n" +
     "- 【Architecture Upgrade】Three-RT architecture (baseRT + paintLayerRT + previewRT): paint layer stored independently,彻底 eliminating color leakage and transparent export color shifts.\n" +
     "- 【Export Enhancement】Transparent layer exports directly from paint layer; white-background export via GPU composition, color-pure, with optional white BG overlay.\n" +
     "- 【Interaction Optimization】Boundary expand uses delayed input (apply on Enter) to avoid frequent rebuilds; symmetry line clipping prevents drawing outside preview area.\n" +
