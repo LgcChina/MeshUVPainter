@@ -3,9 +3,9 @@ using UnityEditor;
 using UnityEngine;
 
 /// <summary>
-/// LGC - ¶Ô³Æ Gizmo ¿ØÖÆÆ÷
-/// ¸ºÔð¶Ô³ÆÏßµÄ»æÖÆ¡¢ÍÏ×§£¬ÒÔ¼° UV ¾µÏñ¼ÆËã
-/// v2.7.0: Ôö¼Ó GUI.BeginClip(previewRect) ²Ã¼ô£¬·ÀÖ¹»æÖÆ³¬³öÔ¤ÀÀÇø
+/// LGC - ï¿½Ô³ï¿½ Gizmo ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+/// ï¿½ï¿½ï¿½ï¿½Ô³ï¿½ï¿½ßµÄ»ï¿½ï¿½Æ¡ï¿½ï¿½ï¿½×§ï¿½ï¿½ï¿½Ô¼ï¿½ UV ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+/// v2.7.0: ï¿½ï¿½ï¿½ï¿½ GUI.BeginClip(previewRect) ï¿½Ã¼ï¿½ï¿½ï¿½ï¿½ï¿½Ö¹ï¿½ï¿½ï¿½Æ³ï¿½ï¿½ï¿½Ô¤ï¿½ï¿½ï¿½ï¿½
 /// </summary>
 internal class LgcSymmetryGizmoController
 {
@@ -17,7 +17,7 @@ internal class LgcSymmetryGizmoController
     private bool draggingLine;
 
     /// <summary>
-    /// ÊÇ·ñËø¶¨£¨Ö»¶Á£¬ÓÃÓÚ StampController ÅÐ¶Ï£©
+    /// ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ StampController ï¿½Ð¶Ï£ï¿½
     /// </summary>
     public bool IsLocked => _locked;
     private bool _locked;
@@ -35,7 +35,7 @@ internal class LgcSymmetryGizmoController
     }
 
     /// <summary>
-    /// Ö÷µ÷ÓÃÈë¿Ú£º»æÖÆ²¢´¦Àí½»»¥
+    /// ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ú£ï¿½ï¿½ï¿½ï¿½Æ²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
     /// </summary>
     public void DrawAndHandle(
         Rect previewRect,
@@ -55,7 +55,7 @@ internal class LgcSymmetryGizmoController
         float handleBase = 14f;
         float handleRadius = handleBase * Mathf.Clamp(Mathf.Sqrt(Mathf.Max(1f, zoom)), 1f, 2f);
 
-        // ¡ï ¹â±ê·´À¡£¨ÔÚÔ¤ÀÀÇøÓòÄÚÓÐÐ§£©
+        // ï¿½ï¿½ ï¿½ï¿½ê·´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô¤ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð§ï¿½ï¿½
         if (previewRect.Contains(e.mousePosition))
         {
             Vector2 localMouse = e.mousePosition - previewRect.position;
@@ -89,7 +89,7 @@ internal class LgcSymmetryGizmoController
                 repaintOnChange);
         }
 
-        // ¡ï ²Ã¼ô»æÖÆ£º½«¶Ô³ÆÏßÏÞÖÆÔÚ previewRect ÄÚ
+        // ï¿½ï¿½ ï¿½Ã¼ï¿½ï¿½ï¿½ï¿½Æ£ï¿½ï¿½ï¿½ï¿½Ô³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ previewRect ï¿½ï¿½
         DrawGizmo(aGui, bGui, handleRadius, locked, previewRect);
     }
 
@@ -99,10 +99,10 @@ internal class LgcSymmetryGizmoController
     {
         Handles.BeginGUI();
 
-        // ¡ï ¹Ø¼üÐÞ¸´£º²Ã¼ôµ½Ô¤ÀÀÇøÓò£¬·ÀÖ¹»æÖÆ³¬³ö
+        // ï¿½ï¿½ ï¿½Ø¼ï¿½ï¿½Þ¸ï¿½ï¿½ï¿½ï¿½Ã¼ï¿½ï¿½ï¿½Ô¤ï¿½ï¿½ï¿½ï¿½ï¿½ò£¬·ï¿½Ö¹ï¿½ï¿½ï¿½Æ³ï¿½ï¿½ï¿½
         GUI.BeginClip(previewRect);
 
-        // ×ªÎª¾Ö²¿×ø±ê£¨Ïà¶ÔÓÚ previewRect ×óÉÏ½Ç£©
+        // ×ªÎªï¿½Ö²ï¿½ï¿½ï¿½ï¿½ê£¨ï¿½ï¿½ï¿½ï¿½ï¿½ previewRect ï¿½ï¿½ï¿½Ï½Ç£ï¿½
         Vector2 la = a - previewRect.position;
         Vector2 lb = b - previewRect.position;
 

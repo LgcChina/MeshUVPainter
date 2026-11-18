@@ -1,8 +1,16 @@
+// LGCPaint.compute (v3.0 beta) - Native gradient color/alpha keys; reversible UV visibility focus.
 #pragma kernel KBrush
 #pragma kernel KFillIsland
 #pragma kernel KComposite
 #pragma kernel KCompositeWhite
 #pragma kernel KStamp
+#pragma kernel KMirrorLayer
+#pragma kernel KResizeExport
+#pragma kernel KGradient
+#pragma kernel KRegionOverlay
+#pragma kernel KPaintTransform
+#pragma kernel KPaintSelectionOverlay
+#pragma kernel KFillRegion
 SamplerState sampler_LinearClamp;
 
 // ====== RW / RO Texture ======
@@ -18,10 +26,25 @@ StructuredBuffer<int> _IslandId; // -1 / islandIndex
 // ====== Common ======
 int2 _TexSize;
 
+// v2.11.0: Region protection is independent of UV boundary and island toggles.
+StructuredBuffer<int> _RegionMask;
+int _OnlyEditSelected;
+StructuredBuffer<int> _PaintSelection;
+int _UsePaintSelection;
+bool RegionUnprotected(int idx)
+{
+    int state = _RegionMask[idx];
+    return (state & 6) == 0 && (_OnlyEditSelected == 0 || (state & 1) != 0);
+}
+bool RegionEditable(int idx)
+{
+    return RegionUnprotected(idx) && (_UsePaintSelection == 0 || _PaintSelection[idx] != 0);
+}
+
 // ====== Brush params ======
 int4 _RectXYWH;
-int2 _Center;
-int _Radius;
+float2 _Center;
+float _Radius;
 float _Hardness;
 float4 _Color;
 float _Opacity;
@@ -65,24 +88,25 @@ void KBrush(uint3 id : SV_DispatchThreadID)
         return;
 
     int idx = y * _TexSize.x + x;
+    if (!RegionEditable(idx)) return;
 
     if (_EnableBoundary == 1 && _UvMask[idx] == 0)
         return;
     if (_EnableIsolation == 1 && _ActiveIslandId >= 0 && _IslandId[idx] != _ActiveIslandId)
         return;
 
-    // 抗锯齿权重
-    float px = (float) x + 0.5f;
-    float py = (float) y + 0.5f;
-    float dx = px - (float) _Center.x;
-    float dy = py - (float) _Center.y;
-    float dist = sqrt(dx * dx + dy * dy);
-
-    float radius = (float) _Radius;
+    // Four subpixel samples keep fine hard brush edges smooth at native work resolution.
+    float2 center = float2(x,y) + 0.5f;
+    float radius = max(0.5f,_Radius);
     float inner = radius * saturate(_Hardness);
-    float edgeWidth = max(1.0f, radius - inner);
-
-    float weight = 1.0f - smoothstep(inner, inner + edgeWidth, dist);
+    float edgeWidth = max(0.001f,radius - inner);
+    float weight = 0;
+    [unroll] for (int sy=0;sy<2;sy++) [unroll] for (int sx=0;sx<2;sx++)
+    {
+        float2 samplePoint = center + float2(sx == 0 ? -.25f : .25f, sy == 0 ? -.25f : .25f);
+        float dist = length(samplePoint - _Center);
+        weight += (1.0f - smoothstep(inner,inner + edgeWidth,dist)) * .25f;
+    }
     if (weight <= 0.0f)
         return;
 
@@ -118,6 +142,7 @@ void KFillIsland(uint3 id : SV_DispatchThreadID)
     int y = (int) gid.y;
 
     int idx = y * _TexSize.x + x;
+    if (!RegionEditable(idx)) return;
     if (_IslandId[idx] != _FillIslandId)
         return;
 
@@ -190,6 +215,8 @@ float2 _StampCenter; // UV 中心 (0~1)
 float _StampScale;
 float _StampRotation; // 弧度
 float _StampOpacity;
+float4 _StampOverlayColor;
+float _StampColorStrength;
 float _StampMirror; // ★ 1.0 = 水平翻转, 0.0 = 正常
 
 [numthreads(16, 16, 1)]
@@ -212,6 +239,7 @@ void KStamp(uint3 id : SV_DispatchThreadID)
 
     // UV 边界限制
     int idx = y * _TexSize.x + x;
+    if (!RegionEditable(idx)) return;
     if (_EnableBoundary == 1 && _UvMask[idx] == 0)
         return;
 
@@ -254,6 +282,8 @@ void KStamp(uint3 id : SV_DispatchThreadID)
     // 采样图案
     float4 stampColor = _StampTex.SampleLevel(sampler_LinearClamp, stampUV, 0);
 
+    stampColor.rgb = lerp(stampColor.rgb, _StampOverlayColor.rgb, saturate(_StampColorStrength));
+
     // 透明度阈值
     float alpha = stampColor.a * _StampOpacity;
     if (alpha < 0.005f)
@@ -263,4 +293,179 @@ void KStamp(uint3 id : SV_DispatchThreadID)
     float4 dst = _PaintLayerRT[int2(x, y)];
     dst = BlendOver(dst, stampColor.rgb, alpha);
     _PaintLayerRT[int2(x, y)] = dst;
+}
+// v2.10.0: Snapshot source prevents in-place mirror read/write races.
+Texture2D<float4> _MirrorSource;
+float4 _MirrorAxis;
+int _MirrorSourceSide;
+[numthreads(16, 16, 1)]
+void KMirrorLayer(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (any(p >= _TexSize)) return;
+    if (!RegionEditable(p.y * _TexSize.x + p.x)) return;
+    if (_EnableBoundary == 1 && _UvMask[p.y * _TexSize.x + p.x] == 0) return;
+    float2 uv = (float2(p) + 0.5f) / _TexSize;
+    float2 axis = _MirrorAxis.zw - _MirrorAxis.xy;
+    float len2 = dot(axis, axis);
+    if (len2 < 1e-8f) return;
+    float2 normal = float2(-axis.y, axis.x) * rsqrt(len2);
+    float side = dot(uv - _MirrorAxis.xy, normal);
+    // Side A is left of the directed axis (bottom -> top by default).
+    if ((_MirrorSourceSide == 0 && side >= -1e-7f) || (_MirrorSourceSide == 1 && side <= 1e-7f)) return;
+    float2 reflected = uv - 2.0f * side * normal;
+    if (any(reflected < 0) || any(reflected >= 1)) return;
+    int2 src = clamp(int2(reflected * _TexSize), int2(0,0), _TexSize - 1);
+    float4 layer = _MirrorSource.Load(int3(src, 0));
+    // Preserve destination artwork, overlay only painted source pixels.
+    _PaintLayerRT[p] = BlendOver(_PaintLayerRT[p], layer.rgb, layer.a);
+}
+
+// Alpha-aware bilinear resampling avoids dark fringes on transparent paint exports.
+Texture2D<float4> _ExportSource;
+int2 _ExportSize;
+float4 ExportPremultiplied(int2 p)
+{
+    float4 c = _ExportSource.Load(int3(clamp(p, int2(0,0), _TexSize - 1), 0));
+    return float4(c.rgb * c.a, c.a);
+}
+[numthreads(16, 16, 1)]
+void KResizeExport(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (any(p >= _ExportSize)) return;
+    float2 position = (float2(p) + 0.5f) * _TexSize / _ExportSize - 0.5f;
+    int2 lo = int2(floor(position));
+    float2 f = frac(position);
+    float4 c = lerp(lerp(ExportPremultiplied(lo), ExportPremultiplied(lo + int2(1,0)), f.x),
+                    lerp(ExportPremultiplied(lo + int2(0,1)), ExportPremultiplied(lo + int2(1,1)), f.x), f.y);
+    _ResultRT[p] = c.a > 1e-6f ? float4(c.rgb / c.a, c.a) : float4(0,0,0,0);
+}
+
+// v2.11.0: Linear color/alpha gradient clipped by region and native UV island.
+float4 _GradientAxis, _GradientColorsA, _GradientColorsB;
+float _GradientOpacity;
+float4 _GradientColorKeys[8], _GradientAlphaKeys[8];
+int _GradientColorCount, _GradientAlphaCount, _GradientFixed;
+float4 EvaluatePaintGradient(float t)
+{
+    float3 color=_GradientColorKeys[0].rgb;
+    for(int i=1;i<_GradientColorCount;i++)
+    {
+        float4 a=_GradientColorKeys[i-1],b=_GradientColorKeys[i];
+        if(t<=a.w)break;
+        float u=saturate((t-a.w)/max(b.w-a.w,1e-6f));
+        color=_GradientFixed==1?b.rgb:lerp(a.rgb,b.rgb,u);
+        if(t<=b.w)break;
+    }
+    float alpha=_GradientAlphaKeys[0].x;
+    for(int j=1;j<_GradientAlphaCount;j++)
+    {
+        float4 a=_GradientAlphaKeys[j-1],b=_GradientAlphaKeys[j];
+        if(t<=a.w)break;
+        float u=saturate((t-a.w)/max(b.w-a.w,1e-6f));
+        alpha=_GradientFixed==1?b.x:lerp(a.x,b.x,u);
+        if(t<=b.w)break;
+    }
+    return float4(color,alpha);
+}
+int _GradientErase;
+int _GradientIsland, _GradientUseSelection, _GradientHasSymmetry, _GradientMirrored;
+float2 _GradientOtherStart;
+[numthreads(16,16,1)]
+void KGradient(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (any(p >= _TexSize)) return;
+    int idx = p.y * _TexSize.x + p.x;
+    if (!RegionEditable(idx)) return;
+    if (_EnableBoundary == 1 && _UvMask[idx] == 0) return;
+    if (_GradientUseSelection == 1 && (_RegionMask[idx] & 1) == 0) return;
+    if (_GradientIsland >= 0 && _IslandId[idx] != _GradientIsland) return;
+    float2 uv = (float2(p) + .5f) / _TexSize;
+    if (_GradientHasSymmetry == 1)
+    {
+        float a = dot(uv - _GradientAxis.xy, uv - _GradientAxis.xy);
+        float b = dot(uv - _GradientOtherStart, uv - _GradientOtherStart);
+        if ((_GradientMirrored == 0 && a > b) || (_GradientMirrored == 1 && a >= b)) return;
+    }
+    float2 axis = _GradientAxis.zw - _GradientAxis.xy;
+    float t = saturate(dot(uv - _GradientAxis.xy, axis) / max(dot(axis,axis),1e-8f));
+    float4 c = _GradientErase==1?lerp(_GradientColorsA,_GradientColorsB,t):EvaluatePaintGradient(t);
+    float strength=saturate(c.a*_GradientOpacity);
+    float4 dst=_PaintLayerRT[p];
+    if(_GradientErase==1){dst.a*=1-strength;if(dst.a<.001f)dst=0;}
+    else dst=BlendOver(dst,c.rgb,strength);
+    _PaintLayerRT[p]=dst;
+}
+
+int _HoveredIsland, _ShowRegionSelection, _OnlyShowSelected;
+[numthreads(16,16,1)]
+void KRegionOverlay(uint3 id : SV_DispatchThreadID)
+{
+    int2 p = int2(id.xy);
+    if (any(p >= _TexSize)) return;
+    int idx = p.y * _TexSize.x + p.x;
+    int state = _RegionMask[idx];
+    float4 c = float4(0,0,0,0);
+    if ((state & 2) != 0 || (_OnlyShowSelected==1 && (state & 1)==0)) c = float4(.12f,.12f,.12f,1);
+    else if ((state & 4) != 0) c = float4(.6f,.16f,.12f,.32f);
+    if (_ShowRegionSelection == 1 && (state & 1) != 0) c = (state & 2) != 0 ? float4(.08f,.35f,.12f,1) : float4(.15f,1,.3f,.33f);
+    else if (_ShowRegionSelection == 1 && _HoveredIsland >= 0 && _IslandId[idx] == _HoveredIsland) c = (state & 2) != 0 ? float4(.35f,.27f,.08f,1) : float4(1,.75f,.1f,.4f);
+    _ResultRT[p] = c;
+}
+
+// v2.12.0: Immutable source and premultiplied bilinear filtering for cut/move transforms.
+Texture2D<float4> _SelectionSource;
+float4 _SelectionCenterOffset, _SelectionScaleAngle;
+float2 SelectionSourcePosition(float2 p)
+{
+    float2 d=p-_SelectionCenterOffset.xy-_SelectionCenterOffset.zw;
+    float c=cos(_SelectionScaleAngle.z),s=sin(_SelectionScaleAngle.z);
+    return _SelectionCenterOffset.xy+float2(c*d.x+s*d.y,-s*d.x+c*d.y)/_SelectionScaleAngle.xy;
+}
+bool SelectionSourceEditable(int2 p)
+{
+    if(any(p<0)||any(p>=_TexSize))return false;
+    int i=p.y*_TexSize.x+p.x;
+    return _PaintSelection[i]!=0&&RegionUnprotected(i)&&(_EnableBoundary==0||_UvMask[i]!=0);
+}
+float4 SelectedPremultiplied(int2 p)
+{
+    if(!SelectionSourceEditable(p))return 0;
+    float4 c=_SelectionSource.Load(int3(p,0));return float4(c.rgb*c.a,c.a);
+}
+[numthreads(16,16,1)]
+void KPaintTransform(uint3 id:SV_DispatchThreadID)
+{
+    int2 p=int2(id.xy);if(any(p>=_TexSize))return;
+    float4 dst=_SelectionSource.Load(int3(p,0));int idx=p.y*_TexSize.x+p.x;
+    if(!RegionUnprotected(idx)||(_EnableBoundary==1&&_UvMask[idx]==0)){_ResultRT[p]=dst;return;}
+    if(SelectionSourceEditable(p))dst=0;
+    float2 q=SelectionSourcePosition(float2(p)+.5f)-.5f;int2 lo=int2(floor(q));float2 f=frac(q);
+    float4 c=lerp(lerp(SelectedPremultiplied(lo),SelectedPremultiplied(lo+int2(1,0)),f.x),lerp(SelectedPremultiplied(lo+int2(0,1)),SelectedPremultiplied(lo+int2(1,1)),f.x),f.y);
+    _ResultRT[p]=c.a>1e-6f?BlendOver(dst,c.rgb/c.a,c.a):dst;
+}
+[numthreads(16,16,1)]
+void KPaintSelectionOverlay(uint3 id:SV_DispatchThreadID)
+{
+    int2 p=int2(id.xy);if(any(p>=_TexSize))return;
+    int2 q=int2(floor(SelectionSourcePosition(float2(p)+.5f)));
+    bool selected=all(q>=0)&&all(q<_TexSize);
+    if(selected)selected=_PaintSelection[q.y*_TexSize.x+q.x]!=0;
+    // Display the complete mask, including blank and protected areas.
+    _ResultRT[p]=selected?float4(.1f,.75f,1,.22f):float4(0,0,0,0);
+}
+
+// v2.13.0: CPU identifies the requested region once; GPU blends its union once.
+StructuredBuffer<int> _FillRegion;
+[numthreads(16,16,1)]
+void KFillRegion(uint3 id:SV_DispatchThreadID)
+{
+    int2 p=int2(id.xy);if(any(p>=_TexSize))return;
+    int i=p.y*_TexSize.x+p.x;if(_FillRegion[i]==0||!RegionEditable(i))return;
+    float4 dst=_PaintLayerRT[p];
+    if(_FillMode==1){dst.a*=1-saturate(_Opacity);if(dst.a<.001f)dst=0;}
+    else dst=BlendOver(dst,_Color.rgb,saturate(_Opacity));
+    _PaintLayerRT[p]=dst;
 }

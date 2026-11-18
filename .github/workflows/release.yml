@@ -85,3 +85,6 @@ jobs:
             ${{ env.unityPackage }}
             ${{ env.packagePath }}/package.json
           tag_name: ${{ env.version }}
+          name: "LGC Mesh UV Painter ${{ env.version }}"
+          prerelease: ${{ contains(env.version, '-') }}
+          body_path: .github/release-notes.md

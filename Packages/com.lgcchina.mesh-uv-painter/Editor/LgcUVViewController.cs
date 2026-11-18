@@ -1,4 +1,5 @@
 ﻿#if UNITY_EDITOR
+// v2.10.0: Configurable right-button pan with pointer capture and cancellation.
 using UnityEngine;
 using UnityEditor;
 
@@ -47,29 +48,40 @@ internal class LgcUVViewController
 
     #region Navigation
 
-    public void HandleNavigation(Rect previewRect)
+    private int panControlId;
+    private int panButton = -1;
+
+    public void HandleNavigation(Rect previewRect, bool rightButtonPan = false)
     {
+        panControlId = GUIUtility.GetControlID("LgcCanvasPan".GetHashCode(), FocusType.Passive);
         Event e = Event.current;
-        if (e == null || !previewRect.Contains(e.mousePosition))
-            return;
-
-        if (e.type == EventType.ScrollWheel)
+        if (e == null) return;
+        if (panButton >= 0 && (GUIUtility.hotControl != panControlId || e.rawType == EventType.MouseUp || (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)))
         {
-            HandleZoom(e, previewRect);
-            e.Use();
-            EditorWindow.focusedWindow?.Repaint();
+            CancelNavigation();
+            if (e.type != EventType.Used) e.Use();
             return;
         }
-
-        bool middleDrag = e.button == 2 && e.type == EventType.MouseDrag;
-        bool altLeftDrag = e.button == 0 && e.alt && e.type == EventType.MouseDrag;
-
-        if (middleDrag || altLeftDrag)
+        bool inside = previewRect.Contains(e.mousePosition);
+        if (inside && e.type == EventType.ScrollWheel && GUIUtility.hotControl == 0)
         {
-            HandlePan(e, previewRect);
-            e.Use();
-            EditorWindow.focusedWindow?.Repaint();
+            HandleZoom(e, previewRect); e.Use(); EditorWindow.focusedWindow?.Repaint(); return;
         }
+        bool panGesture = e.button == 2 || (e.button == 0 && e.alt) || (e.button == 1 && rightButtonPan);
+        if (inside && panGesture && e.type == EventType.MouseDown && GUIUtility.hotControl == 0)
+        {
+            panButton = e.button; GUIUtility.hotControl = panControlId; e.Use();
+        }
+        else if (panButton == e.button && GUIUtility.hotControl == panControlId && e.type == EventType.MouseDrag)
+        {
+            HandlePan(e, previewRect); e.Use(); EditorWindow.focusedWindow?.Repaint();
+        }
+    }
+
+    public void CancelNavigation()
+    {
+        if (panControlId != 0 && GUIUtility.hotControl == panControlId) GUIUtility.hotControl = 0;
+        panButton = -1;
     }
 
     private void HandleZoom(Event e, Rect previewRect)

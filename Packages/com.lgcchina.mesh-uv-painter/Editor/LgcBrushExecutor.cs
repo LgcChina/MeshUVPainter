@@ -1,10 +1,11 @@
 #if UNITY_EDITOR
+// LgcBrushExecutor.cs (v2.11.0) - Shared fractional radius for GPU coverage and stroke spacing.
 using UnityEngine;
 
 /// <summary>
-/// LGC - GPU»­±ÊÖ´ĞĞÆ÷
-/// ½ö¸ºÔğĞŞ¸Ä PaintLayerRT£¨»æÖÆ²ã£©
-/// ²»´¦ÀíÊäÈë¡¢²»´¦ÀíÔ¤ÀÀºÏ³É¡¢²»´¦Àíµ¼³ö
+/// LGC - GPUç”»ç¬”æ‰§è¡Œå™¨
+/// ä»…è´Ÿè´£ä¿®æ”¹ PaintLayerRTï¼ˆç»˜åˆ¶å±‚ï¼‰
+/// ä¸å¤„ç†è¾“å…¥ã€ä¸å¤„ç†é¢„è§ˆåˆæˆã€ä¸å¤„ç†å¯¼å‡º
 /// </summary>
 internal class LgcBrushExecutor
 {
@@ -39,19 +40,21 @@ internal class LgcBrushExecutor
         int activeIslandId,
         bool enableBoundary,
         bool enableIsolation,
-        LgcBrushSettings brush)
+        LgcBrushSettings brush,
+        float effectiveRadius)
     {
         if (!IsValid(uv)) return;
         brush.Clamp();
 
-        int cx = Mathf.RoundToInt(uv.x * (paintLayerRT.width - 1));
-        int cy = Mathf.RoundToInt(uv.y * (paintLayerRT.height - 1));
-        int r = brush.Size;
+        float cx = uv.x * paintLayerRT.width;
+        float cy = uv.y * paintLayerRT.height;
+        float radius = Mathf.Max(0.5f, effectiveRadius);
+        int r = Mathf.CeilToInt(radius + 1f);
 
-        int x0 = Mathf.Clamp(cx - r, 0, paintLayerRT.width - 1);
-        int y0 = Mathf.Clamp(cy - r, 0, paintLayerRT.height - 1);
-        int x1 = Mathf.Clamp(cx + r, 0, paintLayerRT.width - 1);
-        int y1 = Mathf.Clamp(cy + r, 0, paintLayerRT.height - 1);
+        int x0 = Mathf.Clamp(Mathf.FloorToInt(cx) - r, 0, paintLayerRT.width - 1);
+        int y0 = Mathf.Clamp(Mathf.FloorToInt(cy) - r, 0, paintLayerRT.height - 1);
+        int x1 = Mathf.Clamp(Mathf.CeilToInt(cx) + r, 0, paintLayerRT.width - 1);
+        int y1 = Mathf.Clamp(Mathf.CeilToInt(cy) + r, 0, paintLayerRT.height - 1);
 
         int rw = x1 - x0 + 1;
         int rh = y1 - y0 + 1;
@@ -62,8 +65,9 @@ internal class LgcBrushExecutor
         SetupBrushParams(
             kBrush,
             new RectInt(x0, y0, rw, rh),
-            new Vector2Int(cx, cy),
+            new Vector2(cx, cy),
             brush,
+            radius,
             isBrushMode
         );
 
@@ -81,13 +85,15 @@ internal class LgcBrushExecutor
         int activeIslandId,
         bool enableBoundary,
         bool enableIsolation,
-        LgcBrushSettings brush)
+        LgcBrushSettings brush,
+        float effectiveRadius)
     {
-        Vector2 pA = uvA * (paintLayerRT.width - 1);
-        Vector2 pB = uvB * (paintLayerRT.width - 1);
+        Vector2 textureSize = new Vector2(paintLayerRT.width - 1, paintLayerRT.height - 1);
+        Vector2 pA = Vector2.Scale(uvA, textureSize);
+        Vector2 pB = Vector2.Scale(uvB, textureSize);
 
         float dist = Vector2.Distance(pA, pB);
-        float spacing = Mathf.Max(1f, brush.Size * (0.7f - 0.4f * brush.Hardness));
+        float spacing = Mathf.Max(1f, Mathf.Max(0.5f, effectiveRadius) * (0.7f - 0.4f * brush.Hardness));
         int steps = Mathf.Max(1, Mathf.CeilToInt(dist / spacing));
 
         for (int i = 0; i <= steps; i++)
@@ -99,7 +105,8 @@ internal class LgcBrushExecutor
                 activeIslandId,
                 enableBoundary,
                 enableIsolation,
-                brush);
+                brush,
+                effectiveRadius);
         }
     }
 
@@ -141,14 +148,15 @@ internal class LgcBrushExecutor
     private void SetupBrushParams(
         int kernel,
         RectInt rect,
-        Vector2Int center,
+        Vector2 center,
         LgcBrushSettings brush,
+        float effectiveRadius,
         bool isBrushMode)
     {
         shader.SetInts("_RectXYWH", rect.x, rect.y, rect.width, rect.height);
         shader.SetInts("_TexSize", paintLayerRT.width, paintLayerRT.height);
-        shader.SetInts("_Center", center.x, center.y);
-        shader.SetInt("_Radius", brush.Size);
+        shader.SetFloats("_Center", center.x, center.y);
+        shader.SetFloat("_Radius", effectiveRadius);
         shader.SetFloat("_Hardness", brush.Hardness);
         shader.SetFloat("_Opacity", brush.Opacity);
         shader.SetFloats("_Color",

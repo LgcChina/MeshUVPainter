@@ -1,6 +1,9 @@
 #if UNITY_EDITOR
 // LGC网格UV绘画工具（GPU版） - Unity 2022+
-// LgcMeshUVColorPainter_GPU.cs (v2.7.0)
+// LgcMeshUVColorPainter_GPU.cs (v3.0 beta)
+// v3.0 beta: Live multi-stop gradients, symmetry cards and reversible UV focus controls.
+// v2.10.0: Unified symmetry, undoable layer mirror, configurable input and resolution export.
+// v2.9.1: Restore render targets after GPU copies; capture stamp drags and isolate GUI state.
 // 【材质组 UV 作用域】
 // - UV 叠加、边界遮罩与孤岛按当前材质组生成
 // - 支持全部子网格只读查看模式
@@ -13,14 +16,16 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using Object = UnityEngine.Object;
 
-public class LgcMeshUVColorPainter : EditorWindow
+public partial class LgcMeshUVColorPainter : EditorWindow
 {
-    internal const string VERSION = "v2.7.0";
+    internal const string VERSION = "v3.0 beta";
     public static string VersionString => VERSION;
     private const string LOG_PREFIX = "[LGC网格UV绘画工具(GPU)] ";
 
@@ -44,11 +49,22 @@ public class LgcMeshUVColorPainter : EditorWindow
     private string originalAssetPath;
 
     private int previewMaterialSlotIndex = -1;
+    private Material previewMaterial;
+    private Renderer previewRenderer;
+    private Material previewOriginalMaterial;
+    private bool previewRepairPending;
 
     // ====== GPU 三RT架构 ======
     private RenderTexture baseRT;
     private RenderTexture paintLayerRT;
     private RenderTexture previewRT;
+    private RenderTexture stampPreviewLayerRT;
+    private RenderTexture stampPreviewRT;
+    private LgcStampSettings cachedStampPreview;
+    private LgcStampSettings suppressedStampPreview;
+    private Vector2 cachedStampSymA, cachedStampSymB;
+    private Vector2 suppressedStampSymA, suppressedStampSymB;
+    private bool stampPreviewDirty = true;
     private const RenderTextureFormat RTFormat = RenderTextureFormat.ARGB32;
     private const GraphicsFormat GFormat = GraphicsFormat.R8G8B8A8_UNorm;
 
@@ -60,6 +76,8 @@ public class LgcMeshUVColorPainter : EditorWindow
     private int kComposite;
     private int kCompositeWhite;
     private int kStamp;
+    private int kMirrorLayer;
+    private int kResizeExport;
     private bool computeReady = false;
 
     private int maskW, maskH;
@@ -77,9 +95,15 @@ public class LgcMeshUVColorPainter : EditorWindow
     private Rect previewRect;
     private Vector2 lastUV = new Vector2(-1, -1);
     private bool isPainting = false;
+    private enum RightMouseAction { Erase, Pan, None }
+    [SerializeField] private RightMouseAction rightMouseAction = RightMouseAction.Erase;
+    [SerializeField] private int exportResolutionIndex;
+    private int mirrorSourceSide;
+    private int paintControlId;
+    private int strokeButton;
+    private bool strokeErase;
     private bool _strokeActive = false;
 
-    private bool foldUVPanel = false;
     private bool showUVOverlay = true;
     private Color uvColor = new Color(0.65f, 0.65f, 0.65f, 1f);
     private float uvAlpha = 0.85f;
@@ -90,7 +114,7 @@ public class LgcMeshUVColorPainter : EditorWindow
     private bool sharedAtlasDetected = false;
 
     // ★ 新增 Stamp 模式
-    private enum PaintMode { Brush, Erase, Fill, IslandErase, Stamp }
+    private enum PaintMode { Brush, Erase, Fill, IslandErase, Stamp, Gradient, Selection }
     private enum UVOverlayScope { CurrentMaterialGroup, AllSubMeshes }
     private PaintMode mode = PaintMode.Brush;
 
@@ -115,7 +139,14 @@ public class LgcMeshUVColorPainter : EditorWindow
     private LgcBrushExecutor brushExecutor;
 
     // ★ ====== 图章系统 ======
-    private bool foldStampSection = false;
+    private int activeToolTab = 0; // 0 Draw, 1 Stamp, 2 UV Boundary, 3 Selection/Gradient
+    private readonly Vector2[] toolTabScroll = new Vector2[4];
+    private PaintMode lastDrawMode = PaintMode.Brush;
+    private PaintMode lastSelectionMode = PaintMode.Selection;
+    private int eraseMode, fillScope;
+    private bool drawAdvancedTab;
+    private bool IsGradientEditing => activeToolTab == 3 && mode == PaintMode.Gradient || activeToolTab == 0 && mode == PaintMode.Erase && eraseMode == 2;
+    private bool IsGradientErasing => activeToolTab == 0 && mode == PaintMode.Erase && eraseMode == 2;
     private LgcStampSettings stampSettings;
     private LgcStampController stampController;
     private LgcStampExecutor stampExecutor;
@@ -143,8 +174,10 @@ public class LgcMeshUVColorPainter : EditorWindow
         public void Return(RenderTexture rt)
         {
             if (rt == null) return;
+            if ((long)rt.width * rt.height * 4 > 32L * 1024 * 1024) { SafeReleaseRT(rt); return; }
             var key = (rt.width, rt.height);
             if (!_dict.TryGetValue(key, out var s)) _dict[key] = s = new Stack<RenderTexture>();
+            if (s.Count >= 1) { SafeReleaseRT(rt); return; }
             s.Push(rt);
         }
         public void DisposeAll()
@@ -166,6 +199,7 @@ public class LgcMeshUVColorPainter : EditorWindow
     private static void SafeReleaseRT(RenderTexture rt)
     {
         if (rt == null) return;
+        if (RenderTexture.active == rt) RenderTexture.active = null;
         rt.Release();
         DestroyImmediate(rt);
     }
@@ -181,28 +215,32 @@ public class LgcMeshUVColorPainter : EditorWindow
     private string infoMessage;
     private MessageType infoType = MessageType.Info;
 
-    private Vector2 leftScroll;
 
     private string _targetResourceDir = "Assets/LGC/Tools/UV绘画/输出图片";
 
     // ====== 左侧折叠面板 ======
-    private bool foldTargetSelection = true;
-    private bool foldModeSection = true;
-    private bool foldBrushSection = true;
-    private bool foldBoundarySection = true;
-    private bool foldSymmetrySection = false;
-    private bool foldSaveSection = true;
 
     [MenuItem("LGC/LGC网格UV绘画工具（GPU）")]
     public static void ShowWindow()
     {
-        var window = GetWindow<LgcMeshUVColorPainter>("LGC网格UV绘画工具（GPU）");
-        window.minSize = new Vector2(LEFT_PANEL_MIN_WIDTH + 600f, 600f);
+        var window = GetWindow<LgcMeshUVColorPainter>($"LGC网格UV绘画工具 {VERSION}");
+        window.minSize = new Vector2(LEFT_PANEL_MIN_WIDTH + 600f, 560f);
         window.Show();
     }
 
     private void OnEnable()
     {
+        titleContent = new GUIContent($"LGC网格UV绘画工具 {VERSION}");
+        EditorApplication.update -= UpdateGradientEditor;
+        EditorApplication.update += UpdateGradientEditor;
+        Undo.undoRedoPerformed -= OnUnityUndoRedo;
+        Undo.undoRedoPerformed += OnUnityUndoRedo;
+        EditorSceneManager.sceneSaving -= OnSceneSaving;
+        EditorSceneManager.sceneSaving += OnSceneSaving;
+        AssemblyReloadEvents.beforeAssemblyReload -= RestoreOriginalMaterial;
+        AssemblyReloadEvents.beforeAssemblyReload += RestoreOriginalMaterial;
+        EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
+        EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
         EnsureCheckerTexture();
         mode = PaintMode.Brush;
         var L = EditorLanguageManager.Instance; L.InitLanguageData();
@@ -218,6 +256,23 @@ public class LgcMeshUVColorPainter : EditorWindow
         stampSettings = new LgcStampSettings();
         stampController = new LgcStampController(stampSettings);
         previewDirty = true;
+        if (targetObject != null) TryBindTarget(targetObject);
+    }
+
+    private void OnDisable()
+    {
+        EditorApplication.update -= UpdateGradientEditor;
+        CleanupUnappliedOutputIfAny();
+        Undo.undoRedoPerformed -= OnUnityUndoRedo;
+        EditorSceneManager.sceneSaving -= OnSceneSaving;
+        AssemblyReloadEvents.beforeAssemblyReload -= RestoreOriginalMaterial;
+        EditorApplication.playModeStateChanged -= OnPlayModeStateChanged;
+        EditorApplication.delayCall -= RepairPreviewAfterUndo;
+        previewRepairPending = false;
+        RestoreOriginalMaterial();
+        ReleaseGPUResources();
+        if (rtPool != null) rtPool.DisposeAll();
+        LgcMeshUVOverlayDrawer.ClearCache();
     }
 
     private void OnDestroy()
@@ -230,6 +285,21 @@ public class LgcMeshUVColorPainter : EditorWindow
     }
 
     private void OnGUI()
+    {
+        Matrix4x4 matrix = GUI.matrix;
+        Color color = GUI.color, contentColor = GUI.contentColor, backgroundColor = GUI.backgroundColor;
+        RenderTexture renderTarget = RenderTexture.active;
+        float labelWidth = EditorGUIUtility.labelWidth;
+        try { DrawWindowGUI(); }
+        finally
+        {
+            GUI.matrix = matrix; GUI.color = color; GUI.contentColor = contentColor; GUI.backgroundColor = backgroundColor;
+            EditorGUIUtility.labelWidth = labelWidth;
+            RenderTexture.active = renderTarget;
+        }
+    }
+
+    private void DrawWindowGUI()
     {
         var L = EditorLanguageManager.Instance; L.InitLanguageData();
         HandleGlobalShortcuts(Event.current);
@@ -245,18 +315,16 @@ public class LgcMeshUVColorPainter : EditorWindow
         float targetLeft = position.width * 0.45f;
         _leftPanelWidth = Mathf.Clamp(targetLeft, LEFT_PANEL_MIN_WIDTH, LEFT_PANEL_MAX_WIDTH);
         minSize = new Vector2(LEFT_PANEL_MIN_WIDTH + 600f, 560f);
-        EditorGUIUtility.labelWidth = Mathf.Max(160f, _leftPanelWidth - 160f);
+        EditorGUIUtility.labelWidth = Mathf.Clamp(_leftPanelWidth * 0.44f, 135f, 190f);
 
         EditorGUILayout.BeginHorizontal();
-        EditorGUILayout.BeginVertical(GUILayout.MinWidth(LEFT_PANEL_MIN_WIDTH), GUILayout.Width(_leftPanelWidth));
+        EditorGUILayout.BeginVertical(GUILayout.MinWidth(LEFT_PANEL_MIN_WIDTH), GUILayout.Width(_leftPanelWidth), GUILayout.ExpandHeight(true));
         GUILayout.Label(L.GetText("LeftPanelTitle"), EditorStyles.boldLabel);
-        leftScroll = EditorGUILayout.BeginScrollView(leftScroll);
         DrawLeftPanel();
-        EditorGUILayout.EndScrollView();
         EditorGUILayout.EndVertical();
 
         EditorGUILayout.BeginVertical(GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
-        GUILayout.Label(L.GetText("RightPanelTitle"), EditorStyles.boldLabel);
+        DrawCanvasHeader();
         rightPanelRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
         DrawRightPanel(rightPanelRect);
         EditorGUILayout.EndVertical();
@@ -270,18 +338,17 @@ public class LgcMeshUVColorPainter : EditorWindow
         };
         using (new GUILayout.HorizontalScope())
         {
+            string sizeInfo = GetTextureSizeInfo();
+            GUILayout.Label(new GUIContent(sizeInfo,sizeInfo),EditorStyles.miniLabel,GUILayout.Width(_leftPanelWidth));
             GUILayout.FlexibleSpace();
             var authorTxt = L.GetText("BottomAuthorInfo");
             var verTxt = string.Format(L.GetText("BottomVersionInfo"), VERSION);
             var content = new GUIContent($"{authorTxt} {verTxt}", L.GetText("ClickToSeeMore"));
-            var btnStyle = new GUIStyle(labelStyle);
-            Rect r = GUILayoutUtility.GetRect(new GUIContent(content), btnStyle, GUILayout.Height(18));
-            EditorGUIUtility.AddCursorRect(r, MouseCursor.Link);
-            if (GUI.Button(r, content, btnStyle))
-            {
-                LgcAuthorInfoWindow.OpenWindow();
-            }
+            Rect r = GUILayoutUtility.GetRect(content,labelStyle,GUILayout.Height(18));
+            EditorGUIUtility.AddCursorRect(r,MouseCursor.Link);
+            if(GUI.Button(r,content,labelStyle))LgcAuthorInfoWindow.OpenWindow();
             GUILayout.FlexibleSpace();
+            GUILayout.Label(GetTextureViewInfo(),EditorStyles.miniLabel,GUILayout.Width(64));
         }
     }
 
@@ -289,7 +356,7 @@ public class LgcMeshUVColorPainter : EditorWindow
     {
         if (e == null) return;
         if (e.type != EventType.KeyDown) return;
-        if (focusedWindow != this) return;
+        if (focusedWindow != this || EditorGUIUtility.editingTextField) return;
         bool ctrl = e.control || e.command;
         if (!ctrl) return;
 
@@ -304,321 +371,398 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
     }
 
+    private void DrawCanvasHeader()
+    {
+        var L = EditorLanguageManager.Instance;
+        using (new EditorGUILayout.HorizontalScope())
+        {
+            GUILayout.Label(L.GetText("RightPanelTitle"), EditorStyles.boldLabel, GUILayout.Width(58));
+            string hint = L.GetText(IsGradientEditing ? "CanvasGradientHint" : activeToolTab == 2 ? "CanvasUVSelectionHint" : activeToolTab == 1 ? "CanvasStampHint" : mode == PaintMode.Selection ? "CanvasSelectionHint" : paintSelectionCount > 0 ? "CanvasSelectedPaintHint" : "CanvasPaintHint");
+            Rect hintRect = GUILayoutUtility.GetRect(20f, 18f, GUILayout.ExpandWidth(true));
+            GUI.Label(hintRect, new GUIContent(hint, hint), EditorStyles.miniLabel);
+
+        }
+    }
+
+    private string GetTextureViewInfo() => $"{viewController.Zoom:0.##}x";
+    private string GetTextureSizeInfo()
+    {
+        string original=originalTexture!=null?$"{originalTexture.width} X {originalTexture.height}":"—";
+        string work=paintLayerRT!=null?$"{paintLayerRT.width} X {paintLayerRT.height}":"—";
+        return $"{T("OriginalSize")}{original} - {T("WorkingSize")}{work}";
+    }
+
     private void DrawLeftPanel()
     {
-        _ = infoType;
-        var L = EditorLanguageManager.Instance;
-        var wrapHelp = new GUIStyle(EditorStyles.helpBox) { wordWrap = true };
-        EditorGUILayout.LabelField(infoMessage, wrapHelp);
+        DrawTargetPanel();
+        DrawToolTabs();
+        GUILayout.Space(4);
+        DrawOperationStatus();
+        DrawOutputPanel();
+    }
 
-        // 目标选择
-        foldTargetSelection = EditorGUILayout.Foldout(foldTargetSelection, L.GetText("TargetSelectionFoldout"), true);
-        if (foldTargetSelection)
+    private void DrawTargetPanel()
+    {
+        var L = EditorLanguageManager.Instance;
+        using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
         {
-            EditorGUI.indentLevel++;
+            GUILayout.Label(L.GetText("TargetSelectionFoldout"), EditorStyles.boldLabel);
             EditorGUI.BeginChangeCheck();
             targetObject = (GameObject)EditorGUILayout.ObjectField(L.GetText("TargetObject"), targetObject, typeof(GameObject), true);
             if (EditorGUI.EndChangeCheck()) TryBindTarget(targetObject);
-
-            using (new EditorGUI.DisabledScope(targetObject == null || targetMesh == null || targetRenderer == null))
+            using (new EditorGUI.DisabledScope(targetRenderer == null || targetMesh == null))
+            using (new EditorGUILayout.HorizontalScope())
             {
                 if (sharedMats != null && sharedMats.Length > 0)
                 {
-                    int newIndex = EditorGUILayout.Popup(L.GetText("MatSlot"), selectedMatIndex, matSlotNames);
-                    if (newIndex != selectedMatIndex)
+                    int next = EditorGUILayout.Popup(L.GetText("MatSlot"), selectedMatIndex, matSlotNames);
+                    if (next != selectedMatIndex)
                     {
                         ForceRestorePreviewMaterial();
-                        selectedMatIndex = newIndex;
+                        selectedMatIndex = next;
                         BindMaterialSlot();
                     }
                 }
-                else
-                {
-                    EditorGUILayout.LabelField(L.GetText("MatSlot"), L.GetText("MatSlotNone"));
-                }
-                if (GUILayout.Button(L.GetText("RefreshSlot"))) BindMaterialSlot();
+                else EditorGUILayout.LabelField(L.GetText("MatSlot"), L.GetText("MatSlotNone"));
+                if (GUILayout.Button(new GUIContent(L.GetText("RefreshShort"), L.GetText("RefreshSlot")), GUILayout.Width(64))) BindMaterialSlot();
             }
-            EditorGUI.indentLevel--;
-        }
-
-        // 模式
-        foldModeSection = EditorGUILayout.Foldout(foldModeSection, L.GetText("ModeSectionFoldout"), true);
-        if (foldModeSection)
-        {
-            using (new EditorGUI.DisabledScope(paintLayerRT == null || targetRenderer == null))
+            using (new EditorGUI.DisabledScope(paintLayerRT == null || targetRenderer == null || EditorApplication.isPlayingOrWillChangePlaymode))
             {
-                bool newRealtime = EditorGUILayout.ToggleLeft(L.GetText("RealtimePreviewToggle"), enableRealTimePreview);
-                if (newRealtime != enableRealTimePreview)
-                {
-                    enableRealTimePreview = newRealtime;
-                    if (enableRealTimePreview && paintLayerRT != null)
-                    {
-                        MarkPreviewDirty();
-                        EnsurePreview();
-                        ApplyMaterialInstanceWithTexture(previewRT);
-                        infoMessage = L.GetText("RealtimeOn"); infoType = MessageType.Info;
-                    }
-                    else
-                    {
-                        ForceRestorePreviewMaterial();
-                        infoMessage = L.GetText("RealtimeOff"); infoType = MessageType.Info;
-                    }
-                }
+                bool nextRealtime = EditorGUILayout.ToggleLeft(L.GetText("RealtimePreviewToggle"), enableRealTimePreview);
+                if (nextRealtime != enableRealTimePreview) SetRealtimePreview(nextRealtime);
             }
-            EditorGUI.indentLevel++;
-            EditorGUILayout.Space(8);
-            GUILayout.Label(L.GetText("ModeTitle"), EditorStyles.boldLabel);
-            DrawModeButtons();
-            EditorGUI.indentLevel--;
+            if (sharedAtlasDetected) EditorGUILayout.HelpBox(L.GetText("UVSharedTextureWarning"), MessageType.Warning);
         }
+    }
 
-        // 笔刷
-        foldBrushSection = EditorGUILayout.Foldout(foldBrushSection, L.GetText("BrushSectionFoldout"), true);
-        if (foldBrushSection)
+    private void DrawToolTabs()
+    {
+        var L = EditorLanguageManager.Instance;
+        using (new EditorGUILayout.VerticalScope(GUILayout.ExpandHeight(true)))
         {
-            EditorGUI.indentLevel++;
-            EditorGUILayout.Space(8);
-            GUILayout.Label(L.GetText("BrushAndFill"), EditorStyles.boldLabel);
-            brush.Color = EditorGUILayout.ColorField(L.GetText("BrushOrFillColor"), brush.Color);
-            brush.Size = EditorGUILayout.IntSlider(L.GetText("BrushRadius"), brush.Size, 1, 256);
-            brush.Opacity = EditorGUILayout.Slider(L.GetText("Opacity"), Mathf.Clamp01(brush.Opacity), 0f, 1f);
-            brush.Hardness = EditorGUILayout.Slider(L.GetText("Hardness"), Mathf.Clamp01(brush.Hardness), 0f, 1f);
-            EditorGUI.indentLevel--;
-        }
-
-        // 边界与隔离
-        foldBoundarySection = EditorGUILayout.Foldout(foldBoundarySection, L.GetText("BoundarySectionFoldout"), true);
-        if (foldBoundarySection)
-        {
-            EditorGUI.indentLevel++;
-            EditorGUILayout.Space(8);
-            GUILayout.Label(L.GetText("BoundaryAndIsolationTitle"), EditorStyles.boldLabel);
-
-            uvBoundaryLimitEnabled = EditorGUILayout.ToggleLeft(L.GetText("ToggleUVBoundaryLimit"), uvBoundaryLimitEnabled);
-
-            using (new EditorGUI.DisabledScope(!uvBoundaryLimitEnabled))
+            string[] tabs = { L.GetText("DrawTab"), L.GetText("StampTab"), L.GetText("UVBoundaryTab"), T("SelectionGradientTab") };
+            int next = GUILayout.Toolbar(activeToolTab, tabs, GUILayout.Width(_leftPanelWidth),GUILayout.Height(26));
+            if (next != activeToolTab)
             {
-                EditorGUI.BeginChangeCheck();
-                int newExpand = EditorGUILayout.DelayedIntField(
-                    L.GetText("BoundaryExpandPixels"),
-                    uvBoundaryExpandPixels
-                );
-                if (EditorGUI.EndChangeCheck())
-                {
-                    uvBoundaryExpandPixels = Mathf.Clamp(newExpand, 0, 128);
-                    uvMaskDirty = true;
-                    islandsDirty = true;
-                    ReleaseMaskBuffers();
-                    EnsureMaskBuffersUpToDate();
-                    if (computeReady && paintLayerRT != null &&
-                        uvMaskBuffer != null && islandIdBuffer != null)
-                    {
-                        brushExecutor = new LgcBrushExecutor(csPaint, kBrush, kFillIsland, paintLayerRT, uvMaskBuffer, islandIdBuffer);
-                        stampExecutor = new LgcStampExecutor(csPaint, kStamp, paintLayerRT, uvMaskBuffer, islandIdBuffer);
-                    }
-                    else
-                    {
-                        brushExecutor = null;
-                        stampExecutor = null;
-                    }
-                    MarkPreviewDirty();
-                }
+                FinishActiveStroke();
+                CancelRegionInteraction();
+                regionOverlayDirty = true;
+                stampController?.CancelInteraction();
+                CancelPaintTransform();
+                gradientPending=false;gradientDirty=true;
+                if (activeToolTab == 0) lastDrawMode = mode;
+                if (activeToolTab == 3) lastSelectionMode = mode;
+                activeToolTab = next;
+                if (activeToolTab == 1) mode = PaintMode.Stamp;
+                else if (activeToolTab == 0) mode = lastDrawMode;
+                else if (activeToolTab == 3) mode = lastSelectionMode;
+                Repaint();
             }
-
-            islandIsolationEnabled = EditorGUILayout.ToggleLeft(L.GetText("ToggleIslandIsolation"), islandIsolationEnabled);
-            EditorGUI.indentLevel--;
-        }
-
-        // 对称
-        foldSymmetrySection = EditorGUILayout.Foldout(foldSymmetrySection, L.GetText("SymmetrySectionFoldout"), true);
-        if (foldSymmetrySection)
-        {
-            EditorGUI.indentLevel++;
-            EditorGUILayout.Space(8);
-            GUILayout.Label(L.GetText("SymmetryTitle"), EditorStyles.boldLabel);
-            symmetryEnabled = EditorGUILayout.ToggleLeft(L.GetText("SymmetryEnable"), symmetryEnabled);
-            using (new EditorGUI.DisabledScope(!symmetryEnabled))
+            // MinHeight alone can also clamp maxHeight; keep the range open before enabling stretch.
+            toolTabScroll[activeToolTab] = EditorGUILayout.BeginScrollView(toolTabScroll[activeToolTab],
+                GUILayout.Width(_leftPanelWidth), GUILayout.MinHeight(60f), GUILayout.MaxHeight(float.MaxValue), GUILayout.ExpandHeight(true));
+            using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox,GUILayout.Width(Mathf.Max(100f,_leftPanelWidth-36f))))
             {
-                symmetryLocked = EditorGUILayout.ToggleLeft(L.GetText("SymmetryLock"), symmetryLocked);
-                using (new GUILayout.HorizontalScope())
-                {
-                    if (GUILayout.Button(L.GetText("SymmetryReset"), GUILayout.Width(200)))
-                    {
-                        symmetryController.Reset();
-                        Repaint();
-                    }
-                }
-                var help = new GUIStyle(EditorStyles.helpBox) { wordWrap = true };
-                EditorGUILayout.LabelField(L.GetText("SymmetryHelp"), help);
+                if (activeToolTab == 0) DrawPaintTab();
+                else if (activeToolTab == 1) DrawStampTab();
+                else if (activeToolTab == 2) DrawUVBoundaryTab();
+                else DrawSelectionGradientTab();
             }
-            EditorGUI.indentLevel--;
+            EditorGUILayout.EndScrollView();
         }
+    }
 
-        // ★ 图章区域（默认折叠）
-        foldStampSection = EditorGUILayout.Foldout(foldStampSection, "盖印图案", true);
-        if (foldStampSection)
+    private void DrawPaintTab()
+    {
+        var L=EditorLanguageManager.Instance;
+        GUILayout.Label(L.GetText("PaintTabTitle"),EditorStyles.boldLabel);
+        DrawModeButtons();
+        if(drawAdvancedTab){DrawAdvancedSettings();return;}
+        if(mode==PaintMode.Fill)
+            fillScope=EditorGUILayout.Popup(T("FillScope"),fillScope,new[]{T("FillByIsland"),T("FillByContent"),T("FillBySelection")});
+        if(mode==PaintMode.Erase)
         {
-            EditorGUI.indentLevel++;
-            EditorGUILayout.Space(4);
-
-            stampSettings.StampTexture = (Texture2D)EditorGUILayout.ObjectField(
-                "图案贴图",
-                stampSettings.StampTexture,
-                typeof(Texture2D),
-                false);
-
-            stampSettings.Opacity = EditorGUILayout.Slider(
-                "不透明度",
-                stampSettings.Opacity,
-                0f, 1f);
-
-            stampSettings.ShowPreview = EditorGUILayout.Toggle(
-                "显示预览",
-                stampSettings.ShowPreview);
-
-            // ★ 修改：对称盖印 Toggle 自动启用主对称
-            // ★ 对称盖印
-            EditorGUI.BeginChangeCheck();
-            bool newSym = EditorGUILayout.Toggle("对称盖印", stampSettings.EnableSymmetry);
-            if (EditorGUI.EndChangeCheck())
+            int next=EditorGUILayout.Popup(T("EraseType"),eraseMode,new[]{T("EraseRegular"),T("EraseIsland"),T("EraseGradient")});
+            if(next!=eraseMode){FinishActiveStroke();CancelRegionInteraction();gradientPending=false;eraseMode=next;gradientDirty=true;}
+        }
+        if(IsGradientErasing)DrawGradientSettings();
+        else
+        {
+            GUILayout.Space(4);GUILayout.Label(L.GetText("BrushSectionFoldout"),EditorStyles.boldLabel);
+            if(mode==PaintMode.Brush||mode==PaintMode.Erase&&eraseMode==0)
+                brush.SizeMode=(LgcBrushSizeMode)EditorGUILayout.Popup(L.GetText("BrushSizeMode"),(int)brush.SizeMode,new[]{L.GetText("BrushScreenFixed"),L.GetText("BrushTextureFixed")});
+            if(mode==PaintMode.Brush||mode==PaintMode.Fill)brush.Color=EditorGUILayout.ColorField(L.GetText("BrushOrFillColor"),brush.Color);
+            if(mode==PaintMode.Brush||mode==PaintMode.Erase&&eraseMode==0)
             {
-                stampSettings.EnableSymmetry = newSym;
-                if (newSym && !symmetryEnabled)
+                string radiusLabel=brush.SizeMode==LgcBrushSizeMode.Screen?"BrushScreenRadius":"BrushRadius";
+                brush.Size=EditorGUILayout.IntSlider(L.GetText(radiusLabel),brush.Size,1,256);
+                brush.Hardness=EditorGUILayout.Slider(L.GetText("Hardness"),brush.Hardness,0,1);
+                EditorGUILayout.HelpBox(L.GetText(brush.SizeMode==LgcBrushSizeMode.Screen?"BrushScreenHint":"BrushTextureHint"),MessageType.None);
+            }
+            brush.Opacity=EditorGUILayout.Slider(L.GetText("Opacity"),brush.Opacity,0,1);
+            if(mode==PaintMode.Fill)
+            {
+                EditorGUILayout.HelpBox(T("UnifiedFillHint"),MessageType.None);
+            }
+        }
+        DrawSymmetrySettings();
+    }
+    private void DrawAdvancedSettings()
+    {
+        GUILayout.Space(6);GUILayout.Label(T("AdvancedTitle"),EditorStyles.boldLabel);
+        int action=EditorGUILayout.Popup(T("RightMouseFunction"),(int)rightMouseAction,new[]{T("RightMouseErase"),T("RightMousePan"),T("RightMouseNone")});
+        if(action!=(int)rightMouseAction){FinishActiveStroke();rightMouseAction=(RightMouseAction)action;}
+        DrawPrecisionSettings();
+    }
+    private void DrawSelectionGradientTab()
+    {
+        int selected=mode==PaintMode.Gradient?1:0;
+        int next=GUILayout.Toolbar(selected,new[]{T("ModeSelection"),T("ModeGradient")},GUILayout.Height(26));
+        if(next!=selected){FinishActiveStroke();CancelRegionInteraction();CancelPaintTransform();gradientPending=false;mode=next==0?PaintMode.Selection:PaintMode.Gradient;lastSelectionMode=mode;}
+        if(mode==PaintMode.Gradient){DrawGradientSettings();DrawSymmetrySettings();}
+        else DrawPaintSelectionSettings();
+    }
+
+    private void DrawStampTab()
+    {
+        DrawStampSettings();
+        DrawSymmetrySettings();
+    }
+
+    private void DrawUVBoundaryTab()
+    {
+        EditorGUI.BeginChangeCheck();
+        DrawRegionSettings();
+        DrawBoundarySettings();
+        DrawUVSettings();
+        if (EditorGUI.EndChangeCheck()) MarkPreviewDirty();
+    }
+
+    private void DrawStampSettings()
+    {
+        var L = EditorLanguageManager.Instance;
+        GUILayout.Label(L.GetText("StampSettings"), EditorStyles.boldLabel);
+        stampSettings.StampTexture = (Texture2D)EditorGUILayout.ObjectField(L.GetText("StampTexture"), stampSettings.StampTexture, typeof(Texture2D), false);
+        stampSettings.OverlayColor = EditorGUILayout.ColorField(new GUIContent(L.GetText("StampOverlayColor")), stampSettings.OverlayColor, true, false, false);
+        stampSettings.ColorStrength = EditorGUILayout.Slider(L.GetText("StampColorStrength"), stampSettings.ColorStrength, 0f, 1f);
+        stampSettings.Opacity = EditorGUILayout.Slider(L.GetText("Opacity"), stampSettings.Opacity, 0f, 1f);
+        stampSettings.ShowPreview = EditorGUILayout.Toggle(L.GetText("StampShowPreview"), stampSettings.ShowPreview);
+        EditorGUILayout.HelpBox(L.GetText("StampInteractionHint"), MessageType.None);
+        EditorGUILayout.HelpBox(L.GetText("StampPreviewHint"), MessageType.None);
+        using (new EditorGUI.DisabledScope(stampSettings.StampTexture == null || stampExecutor == null || (symmetryEnabled && !symmetryLocked)))
+            if (GUILayout.Button(L.GetText("StampApply"), GUILayout.Height(26))) ApplyStamp();
+    }
+
+    private void SetSymmetryEnabled(bool enabled)
+    {
+        FinishActiveStroke();
+        symmetryEnabled = enabled;
+        gradientDirty = true;
+        symmetryLocked = false;
+        stampPreviewDirty = true;
+        infoMessage = EditorLanguageManager.Instance.GetText(enabled ? "SymmetrySetupHint" : "SymmetryDisabled");
+        infoType = MessageType.Info;
+        Repaint();
+    }
+
+    private void DrawSymmetrySettings()
+    {
+        var L = EditorLanguageManager.Instance;
+        EditorGUILayout.Space(4);
+        using(new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+        {
+        GUILayout.Label(L.GetText("SymmetrySectionFoldout"), EditorStyles.boldLabel);
+        bool next = EditorGUILayout.ToggleLeft(L.GetText("SymmetryEnable"), symmetryEnabled);
+        if (next != symmetryEnabled) SetSymmetryEnabled(next);
+        using (new EditorGUI.DisabledScope(!symmetryEnabled))
+        {
+            if (symmetryEnabled)
+                EditorGUILayout.HelpBox(L.GetText(symmetryLocked ? "SymmetryLockedHint" : "SymmetrySetupHint"), symmetryLocked ? MessageType.None : MessageType.Info);
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button(L.GetText(symmetryLocked ? "SymmetryAdjust" : "SymmetryLockAndPaint")))
                 {
-                    symmetryEnabled = true;
+                    FinishActiveStroke();
+                    symmetryLocked = !symmetryLocked;
+                    gradientDirty = true;
+                    Repaint();
+                }
+                if (GUILayout.Button(L.GetText("SymmetryReset")))
+                {
+                    FinishActiveStroke();
+                    symmetryController.Reset();
+                    gradientDirty = true;
+                    symmetryLocked = false;
                     Repaint();
                 }
             }
-
-            // ★ 图案镜像（仅在对称盖印启用时显示）
-            using (new EditorGUI.DisabledScope(!stampSettings.EnableSymmetry))
-            {
-                EditorGUI.indentLevel++;
-                stampSettings.MirrorPattern = EditorGUILayout.Toggle("图案镜像", stampSettings.MirrorPattern);
-                EditorGUI.indentLevel--;
-            }
-
-            using (new EditorGUI.DisabledScope(stampSettings.StampTexture == null))
-            {
-                if (GUILayout.Button("应用盖印"))
-                {
-                    ApplyStamp();
-                }
-            }
-
+            if (activeToolTab == 1)
+                stampSettings.MirrorPattern = EditorGUILayout.Toggle(L.GetText("StampMirror"), stampSettings.MirrorPattern);
             EditorGUILayout.Space(4);
-            EditorGUI.indentLevel--;
+            mirrorSourceSide = EditorGUILayout.Popup(L.GetText("MirrorSource"), mirrorSourceSide,
+                new[] { L.GetText("MirrorSideA"), L.GetText("MirrorSideB") });
+            EditorGUILayout.HelpBox(L.GetText("MirrorContentHint"), MessageType.None);
+            using (new EditorGUI.DisabledScope(!symmetryLocked || paintLayerRT == null || (symmetryController.SymB - symmetryController.SymA).sqrMagnitude < 1e-8f))
+                if (GUILayout.Button(L.GetText("MirrorContent"))) MirrorCurrentContent();
         }
+        }
+    }
 
-        // UV叠加
-        foldUVPanel = EditorGUILayout.Foldout(foldUVPanel, L.GetText("UVOverlayFoldout"), true);
-        if (foldUVPanel)
+    private void MirrorCurrentContent()
+    {
+        if (!computeReady || paintLayerRT == null || !symmetryEnabled || !symmetryLocked || uvMaskBuffer == null) return;
+        EnsureRegionResources();
+        Vector2 a = symmetryController.SymA, b = symmetryController.SymB;
+        if ((b - a).sqrMagnitude < 1e-8f) return;
+        FinishActiveStroke();
+        RenderTexture source = null;
+        try
         {
-            EditorGUI.indentLevel++;
-            showUVOverlay = EditorGUILayout.Toggle(L.GetText("ShowUVOverlay"), showUVOverlay);
-            string[] scopeNames =
+            source = NewRT(paintLayerRT.width, paintLayerRT.height);
+            BlitPreservingTarget(paintLayerRT, source);
+            BeginStrokeSnapshot();
+            csPaint.SetTexture(kMirrorLayer, "_MirrorSource", source);
+            csPaint.SetTexture(kMirrorLayer, "_PaintLayerRT", paintLayerRT);
+            csPaint.SetBuffer(kMirrorLayer, "_UvMask", uvMaskBuffer);
+            csPaint.SetInts("_TexSize", paintLayerRT.width, paintLayerRT.height);
+            csPaint.SetVector("_MirrorAxis", new Vector4(a.x, a.y, b.x, b.y));
+            csPaint.SetInt("_MirrorSourceSide", mirrorSourceSide);
+            csPaint.SetInt("_EnableBoundary", uvBoundaryLimitEnabled ? 1 : 0);
+            csPaint.Dispatch(kMirrorLayer, (paintLayerRT.width + 15) / 16, (paintLayerRT.height + 15) / 16, 1);
+            SuppressStampPreview();
+            EndStrokeApply();
+            infoMessage = EditorLanguageManager.Instance.GetText("MirrorContentDone");
+            infoType = MessageType.Info;
+        }
+        finally { SafeReleaseRT(source); }
+        Repaint();
+    }
+
+    private void DrawBoundarySettings()
+    {
+        var L = EditorLanguageManager.Instance;
+        EditorGUILayout.Space(4);
+        GUILayout.Label(L.GetText("BoundarySectionFoldout"), EditorStyles.boldLabel);
+        uvBoundaryLimitEnabled = EditorGUILayout.ToggleLeft(L.GetText("ToggleUVBoundaryLimit"), uvBoundaryLimitEnabled);
+        using (new EditorGUI.DisabledScope(!uvBoundaryLimitEnabled))
+        {
+            EditorGUI.BeginChangeCheck();
+            int expand = EditorGUILayout.DelayedIntField(L.GetText("BoundaryExpandPixels"), uvBoundaryExpandPixels);
+            if (EditorGUI.EndChangeCheck())
             {
-                L.GetText("UVScopeCurrentMaterial"),
-                L.GetText("UVScopeAllSubMeshes")
-            };
-            int newScope = EditorGUILayout.Popup(
-                L.GetText("UVDisplayScope"),
-                (int)uvOverlayScope,
-                scopeNames);
-            if (newScope != (int)uvOverlayScope)
-            {
-                uvOverlayScope = (UVOverlayScope)newScope;
-                RefreshUVScopeDataIfNeeded(true);
-                LgcMeshUVOverlayDrawer.ClearCache();
-                Repaint();
+                uvBoundaryExpandPixels = Mathf.Clamp(expand, 0, 128);
+                uvMaskDirty = true;
+                islandsDirty = true;
+                ReleaseMaskBuffers();
+                EnsureMaskBuffersUpToDate();
+                if (computeReady && paintLayerRT != null && uvMaskBuffer != null && islandIdBuffer != null)
+                {
+                    brushExecutor = new LgcBrushExecutor(csPaint, kBrush, kFillIsland, paintLayerRT, uvMaskBuffer, islandIdBuffer);
+                    stampExecutor = new LgcStampExecutor(csPaint, kStamp, paintLayerRT, uvMaskBuffer, islandIdBuffer);
+                }
+                else { brushExecutor = null; stampExecutor = null; }
+                MarkPreviewDirty();
             }
-            uvColor = EditorGUILayout.ColorField(L.GetText("UVLineColor"), uvColor);
-            uvAlpha = EditorGUILayout.Slider(L.GetText("UVOverlayStrength"), uvAlpha, 0f, 1f);
-            if (uvOverlayScope == UVOverlayScope.AllSubMeshes)
-                EditorGUILayout.HelpBox(L.GetText("UVScopeAllHint"), MessageType.Info);
-            if (sharedAtlasDetected)
-                EditorGUILayout.HelpBox(L.GetText("UVSharedTextureWarning"), MessageType.Warning);
-            EditorGUI.indentLevel--;
         }
+        islandIsolationEnabled = EditorGUILayout.ToggleLeft(L.GetText("ToggleIslandIsolation"), islandIsolationEnabled);
+    }
 
-        // 保存导出
-        foldSaveSection = EditorGUILayout.Foldout(foldSaveSection, L.GetText("SaveSectionFoldout"), true);
-        if (foldSaveSection)
+    private void DrawUVSettings()
+    {
+        var L = EditorLanguageManager.Instance;
+        EditorGUILayout.Space(4);
+        GUILayout.Label(L.GetText("UVOverlayFoldout"), EditorStyles.boldLabel);
+        showUVOverlay = EditorGUILayout.Toggle(L.GetText("ShowUVOverlay"), showUVOverlay);
+        int scope = EditorGUILayout.Popup(L.GetText("UVDisplayScope"), (int)uvOverlayScope,
+            new[] { L.GetText("UVScopeCurrentMaterial"), L.GetText("UVScopeAllSubMeshes") });
+        if (scope != (int)uvOverlayScope)
         {
-            EditorGUI.indentLevel++;
-            EditorGUILayout.Space(8);
-            GUILayout.Label(L.GetText("GroupApplySaveLocate"), EditorStyles.boldLabel);
-            if (GUILayout.Button(L.GetText("LocateProjectResBtn"))) LocateAndCreateResourceDirectory();
+            uvOverlayScope = (UVOverlayScope)scope;
+            RefreshUVScopeDataIfNeeded(true);
+            LgcMeshUVOverlayDrawer.ClearCache();
+            Repaint();
+        }
+        uvColor = EditorGUILayout.ColorField(L.GetText("UVLineColor"), uvColor);
+        uvAlpha = EditorGUILayout.Slider(L.GetText("UVOverlayStrength"), uvAlpha, 0f, 1f);
+        if (uvOverlayScope == UVOverlayScope.AllSubMeshes)
+            EditorGUILayout.HelpBox(L.GetText("UVScopeAllHint"), MessageType.Info);
+    }
 
+    private void DrawOperationStatus()
+    {
+        if (string.IsNullOrEmpty(infoMessage)) return;
+        if (infoType == MessageType.Warning || infoType == MessageType.Error)
+            EditorGUILayout.HelpBox(infoMessage, infoType);
+        else
+            EditorGUILayout.LabelField(new GUIContent(infoMessage, infoMessage), EditorStyles.miniLabel, GUILayout.Height(18));
+    }
+
+    private void DrawOutputPanel()
+    {
+        var L = EditorLanguageManager.Instance;
+        using (new EditorGUILayout.VerticalScope(EditorStyles.helpBox))
+        {
+            Rect history = GUILayoutUtility.GetRect(0f, 26f, GUILayout.ExpandWidth(true));
+            const float gap = 4f;
+            float usable = Mathf.Max(0f, history.width - gap * 2f);
+            using (new EditorGUI.DisabledScope(paintLayerRT == null || undoList.Count == 0))
+                if (GUI.Button(new Rect(history.x, history.y, usable * 0.3f, history.height), new GUIContent(L.GetText("UndoButton"), L.GetText("UndoTooltip")))) DoUndo_Internal();
+            using (new EditorGUI.DisabledScope(paintLayerRT == null || redoStack.Count == 0))
+                if (GUI.Button(new Rect(history.x + usable * 0.3f + gap, history.y, usable * 0.3f, history.height), new GUIContent(L.GetText("RedoButton"), L.GetText("RedoTooltip")))) DoRedo_Internal();
+            using (new EditorGUI.DisabledScope(paintLayerRT == null))
+                if (GUI.Button(new Rect(history.x + usable * 0.6f + gap * 2f, history.y, usable * 0.4f, history.height), L.GetText("ClearCurrentEdits"))) ClearCurrentEdits();
+            GUILayout.Space(4);
+            GUILayout.Label(L.GetText("OutputTitle"), EditorStyles.boldLabel);
+            if (GUILayout.Button(L.GetText("LocateProjectResBtn"))) LocateAndCreateResourceDirectory();
             using (new EditorGUI.DisabledScope(paintLayerRT == null || targetRenderer == null))
             {
-                if (GUILayout.Button(L.GetText("SaveOutputFull"))) SaveOutputOnly();
-                using (new GUILayout.HorizontalScope())
+                using (new EditorGUILayout.HorizontalScope())
                 {
                     if (GUILayout.Button(L.GetText("ExportPaintLayer"))) ExportPaintLayerOnly();
-                    exportPaintLayerOnWhite = GUILayout.Toggle(exportPaintLayerOnWhite, L.GetText("ExportWithWhiteBG"), GUILayout.Width(120));
+                    exportPaintLayerOnWhite = GUILayout.Toggle(exportPaintLayerOnWhite, L.GetText("ExportWithWhiteBG"), GUILayout.Width(110));
                 }
-                EditorGUILayout.Space(4);
-                if (GUILayout.Button(L.GetText("ClearCurrentEdits"))) ClearCurrentEdits();
+                using (new EditorGUILayout.HorizontalScope())
+                {
+                    if (GUILayout.Button(L.GetText("SaveOutputFull"), GUILayout.Height(26))) SaveOutputOnly();
+                    exportResolutionIndex = EditorGUILayout.Popup(exportResolutionIndex,
+                        new[] { new GUIContent(L.GetText("ExportOriginal"), L.GetText("ExportResolutionHint")),
+                            new GUIContent("1024", L.GetText("ExportResolutionHint")), new GUIContent("2048", L.GetText("ExportResolutionHint")),
+                            new GUIContent("4096", L.GetText("ExportResolutionHint")) }, GUILayout.Width(98), GUILayout.Height(26));
+                }
             }
-            EditorGUI.indentLevel--;
         }
     }
 
     private void DrawModeButtons()
     {
-        var L = EditorLanguageManager.Instance;
-        bool isBrush = mode == PaintMode.Brush;
-        bool isErase = mode == PaintMode.Erase;
-        bool isFill = mode == PaintMode.Fill;
-        bool isIslandErase = mode == PaintMode.IslandErase;
-        bool isStamp = mode == PaintMode.Stamp;
-
-        var defaultColor = GUI.color;
-
-        GUI.color = isBrush ? new Color(0.85f, 1f, 0.85f, 1f) : defaultColor;
-        if (GUILayout.Button(L.GetText("ModeBrush"))) { if (mode != PaintMode.Brush) { mode = PaintMode.Brush; Repaint(); } }
-
-        GUI.color = isErase ? new Color(1f, 0.9f, 0.8f, 1f) : defaultColor;
-        if (GUILayout.Button(L.GetText("ModeErase"))) { if (mode != PaintMode.Erase) { mode = PaintMode.Erase; Repaint(); } }
-
-        GUI.color = isFill ? new Color(0.85f, 0.9f, 1f, 1f) : defaultColor;
-        if (GUILayout.Button(L.GetText("ModeFill"))) { if (mode != PaintMode.Fill) { mode = PaintMode.Fill; Repaint(); } }
-
-        GUI.color = isIslandErase ? new Color(1f, 0.95f, 0.6f, 1f) : defaultColor;
-        if (GUILayout.Button(EditorLanguageManager.Instance.GetText("ModeIslandErase")))
-        { if (mode != PaintMode.IslandErase) { mode = PaintMode.IslandErase; Repaint(); } }
-
-        // ★ 盖印模式按钮
-        GUI.color = isStamp ? new Color(0.9f, 0.85f, 1f, 1f) : defaultColor;
-        if (GUILayout.Button("盖印模式"))
+        int selected=drawAdvancedTab?3:mode==PaintMode.Erase||mode==PaintMode.IslandErase?1:mode==PaintMode.Fill?2:0;
+        int next=GUILayout.Toolbar(selected,new[]{T("ModeBrushShort"),T("ModeEraseShort"),T("UnifiedFill"),T("AdvancedTitle")},GUILayout.Height(26));
+        if(next!=selected)
         {
-            if (mode != PaintMode.Stamp)
-            {
-                mode = PaintMode.Stamp;
-                foldStampSection = true;
-                Repaint();
-            }
+            FinishActiveStroke();CancelRegionInteraction();gradientPending=false;
+            drawAdvancedTab=next==3;
+            if(!drawAdvancedTab){mode=next==0?PaintMode.Brush:next==1?PaintMode.Erase:PaintMode.Fill;lastDrawMode=mode;}
+            Repaint();
         }
+    }
 
-        GUI.color = defaultColor;
+    private void FinishActiveStroke()
+    {
+        if (_strokeActive && paintLayerRT != null) EndStrokeApply();
+        _strokeActive = false;
+        isPainting = false;
+        if (paintControlId != 0 && GUIUtility.hotControl == paintControlId) GUIUtility.hotControl = 0;
+        lastUV = new Vector2(-1, -1);
+        activeIslandId = -1;
     }
 
     private void DrawRightPanel(Rect containerRect)
     {
         var L = EditorLanguageManager.Instance;
 
-        const float topBarH = 28f;
-        Rect topBar = new Rect(containerRect.x, containerRect.y, containerRect.width, topBarH);
-        Rect btnRect = new Rect(topBar.x + (topBar.width - 100f) * 0.5f, topBar.y + 4f, 100f, 20f);
-        using (new EditorGUI.DisabledScope(paintLayerRT == null))
-        {
-            if (GUI.Button(btnRect, L.GetText("ResetViewBtn"))) { viewController.ResetView(); Repaint(); }
-        }
-
-        Rect areaRect = new Rect(containerRect.x, containerRect.y + topBarH + 2f,
-                                 containerRect.width, containerRect.height - topBarH - 2f);
-
+        stampController?.PrepareInput();
+        paintControlId = GUIUtility.GetControlID("LgcPaintStroke".GetHashCode(), FocusType.Passive);
+        Rect areaRect = new Rect(containerRect.x, containerRect.y, containerRect.width, Mathf.Max(1f, containerRect.height - 30f));
         if (paintLayerRT == null)
         {
             GUI.Label(new Rect(areaRect.x + 8, areaRect.y + 8, areaRect.width - 16, 20),
@@ -626,10 +770,11 @@ public class LgcMeshUVColorPainter : EditorWindow
             return;
         }
 
+        EnsureRegionResources();
         if (previewRT == null || previewRT.width != paintLayerRT.width || previewRT.height != paintLayerRT.height)
             RecreatePreviewRT();
 
-        EnsurePreview();
+        if (Event.current.type == EventType.Repaint) EnsurePreview();
 
         float cw = Mathf.Max(50f, areaRect.width - 8f);
         float ch = Mathf.Max(50f, areaRect.height - 8f);
@@ -658,10 +803,30 @@ public class LgcMeshUVColorPainter : EditorWindow
         if (Event.current.type == EventType.Repaint && checkerTex != null)
             DrawTiledTexture(previewRect, checkerTex, 16);
 
-        viewController.HandleNavigation(previewRect);
+        PrepareRegionInput();
+        HandlePaintSelectionInput();
+        HandleRegionAndGradientInput();
+
+        // Captured stamp drags get first refusal, including MouseUp outside the canvas.
+        bool stampCanEdit = activeToolTab == 1 && mode == PaintMode.Stamp && (!symmetryEnabled || symmetryLocked) && !IsRegionSelecting;
+        if (stampController != null)
+        {
+            if (!stampCanEdit) stampController.CancelInteraction();
+            else if (stampController.IsEditing)
+                stampController.HandleInput(previewRect, viewController.GetViewRect(), viewController, symmetryController);
+        }
+
+        // Bottom controls consume pointer events before the canvas handles them.
+        Rect resetRect = new Rect(containerRect.center.x - 54f, containerRect.yMax - 26f, 108f, 24f);
+        if (GUI.Button(resetRect, L.GetText("ResetViewBtn"))) { viewController.ResetView(); Repaint(); }
+        if (resetRect.Contains(Event.current.mousePosition) && (Event.current.type == EventType.MouseDown || Event.current.type == EventType.MouseDrag || Event.current.type == EventType.MouseUp || Event.current.type == EventType.ScrollWheel)) Event.current.Use();
+
+        viewController.HandleNavigation(previewRect, rightMouseAction == RightMouseAction.Pan);
         Rect viewRect = viewController.GetViewRect();
 
-        GUI.DrawTextureWithTexCoords(previewRect, previewRT,
+        RenderTexture display = GetDisplayPreviewForGUI(Event.current.type == EventType.Repaint);
+        if (Event.current.type == EventType.Repaint && enableRealTimePreview && !previewRepairPending && !EditorApplication.isPlayingOrWillChangePlaymode) ApplyMaterialInstanceWithTexture(display);
+        GUI.DrawTextureWithTexCoords(previewRect, display,
             new Rect(viewRect.xMin, viewRect.yMin, viewRect.width, viewRect.height));
 
         if (showUVOverlay && targetMesh != null)
@@ -680,52 +845,87 @@ public class LgcMeshUVColorPainter : EditorWindow
                 uvAlpha);
         }
 
-        if (symmetryEnabled)
+        DrawRegionOverlay(viewRect);
+        DrawGradientHandles(viewRect);
+        DrawPaintSelectionOverlay(viewRect);
+
+        if (symmetryEnabled && !IsRegionSelecting && mode != PaintMode.Selection)
             symmetryController.DrawAndHandle(previewRect, viewRect, symmetryLocked, viewController.Zoom, true);
 
         // ★ 图章预览和交互仅在 Stamp 模式下显示
-        if (mode == PaintMode.Stamp && stampController != null)
+        if (activeToolTab == 1 && mode == PaintMode.Stamp && stampController != null)
         {
-            stampController.DrawPreview(previewRect, viewRect, viewController, symmetryController);
+            stampController.DrawPreview(previewRect, viewRect, viewController, symmetryEnabled ? symmetryController : null);
         }
 
         HandlePaintingEvents(viewRect);
         DrawBrushPreview(previewRect, viewRect);
 
         // ★ 图章交互仅在 Stamp 模式下处理
-        if (mode == PaintMode.Stamp && stampController != null)
+        if (stampCanEdit && stampController != null && !stampController.IsEditing)
         {
             stampController.HandleInput(previewRect, viewRect, viewController, symmetryController);
         }
+
+    }
+
+    private float GetEffectiveBrushRadius(Rect viewRect)
+    {
+        if (brush.SizeMode == LgcBrushSizeMode.Texture || paintLayerRT == null) return brush.Size;
+        float scaleX = previewRect.width / Mathf.Max(1e-6f, viewRect.width * paintLayerRT.width);
+        float scaleY = previewRect.height / Mathf.Max(1e-6f, viewRect.height * paintLayerRT.height);
+        return Mathf.Max(0.5f, brush.Size / Mathf.Max(1e-6f, (scaleX + scaleY) * 0.5f));
     }
 
     private void DrawBrushPreview(Rect rect, Rect viewRect)
     {
-        if (paintLayerRT == null) return;
-        Vector2 mouse = Event.current.mousePosition; if (!rect.Contains(mouse)) return;
+        if (IsRegionSelecting || mode == PaintMode.Selection || IsGradientEditing) return;
+        if (Event.current.type != EventType.Repaint) return;
+        if (paintLayerRT == null || (mode != PaintMode.Brush && mode != PaintMode.Erase && !(Event.current.button == 1 && rightMouseAction == RightMouseAction.Erase))) return;
+        if (symmetryEnabled && !symmetryLocked) return;
+        Vector2 mouse = Event.current.mousePosition;
+        if (!rect.Contains(mouse)) return;
         float scaleX = rect.width / Mathf.Max(1e-6f, viewRect.width * paintLayerRT.width);
         float scaleY = rect.height / Mathf.Max(1e-6f, viewRect.height * paintLayerRT.height);
-        float guiRadius = brush.Size * (scaleX + scaleY) * 0.5f;
-        Handles.BeginGUI();
-        Handles.color = new Color(brush.Color.r, brush.Color.g, brush.Color.b, 0.9f);
-        Handles.DrawWireDisc(mouse, Vector3.forward, guiRadius);
-        Handles.DrawWireDisc(mouse, Vector3.forward, Mathf.Max(1f, guiRadius - 1.5f));
-        Handles.EndGUI();
+        float guiRadius = GetEffectiveBrushRadius(viewRect) * (scaleX + scaleY) * 0.5f;
+        Matrix4x4 matrix = GUI.matrix;
+        using (new Handles.DrawingScope((mode == PaintMode.Erase || (Event.current.button == 1 && rightMouseAction == RightMouseAction.Erase)) ? Color.white : new Color(brush.Color.r, brush.Color.g, brush.Color.b, 0.9f)))
+        {
+            GUI.BeginClip(rect);
+            try
+            {
+                Vector2 localMouse = mouse - rect.position;
+                Handles.DrawWireDisc(localMouse, Vector3.forward, guiRadius);
+                Handles.DrawWireDisc(localMouse, Vector3.forward, Mathf.Max(1f, guiRadius - 1.5f));
+            }
+            finally { GUI.EndClip(); GUI.matrix = matrix; }
+        }
     }
 
     private void HandlePaintingEvents(Rect viewRect)
     {
         // ★ 如果处于 Stamp 模式，禁止画笔
-        if (mode == PaintMode.Stamp) return;
+        if (mode == PaintMode.Selection || IsRegionSelecting || (IsGradientEditing && Event.current.button != 1 && !isPainting)) return;
+        bool rightErase = rightMouseAction == RightMouseAction.Erase && Event.current != null && Event.current.button == 1;
+        if ((mode == PaintMode.Stamp || IsGradientEditing) && !rightErase && !isPainting) return;
         // ★ 如果图章正在编辑，禁止画笔（但图章编辑仅在 Stamp 模式下发生，此防御保留）
         if (stampController != null && stampController.IsEditing) return;
 
         if (!computeReady || paintLayerRT == null || brushExecutor == null) return;
+        EnsureRegionResources();
         Event e = Event.current; if (e == null) return;
+
+        if (isPainting && (GUIUtility.hotControl != paintControlId || e.rawType == EventType.MouseUp || (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)))
+        {
+            FinishActiveStroke();
+            if (e.type != EventType.Used) e.Use();
+            Repaint();
+            return;
+        }
 
         if (symmetryEnabled && !symmetryLocked)
         {
-            if (e.button == 0 && (e.type == EventType.MouseDown || e.type == EventType.MouseDrag || e.type == EventType.MouseUp))
+            if (previewRect.Contains(e.mousePosition) && (e.button == 0 || rightErase) && (e.type == EventType.MouseDown || e.type == EventType.MouseDrag || e.type == EventType.MouseUp))
             {
                 var L = EditorLanguageManager.Instance;
                 infoMessage = L.GetText("SymmetryEditingBlockPaint");
@@ -737,6 +937,8 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
 
         bool inside = previewRect.Contains(e.mousePosition);
+        if (e.alt || EditorGUIUtility.editingTextField) return;
+        float effectiveRadius = GetEffectiveBrushRadius(viewRect);
 
         if (inside && e.type == EventType.KeyDown)
         {
@@ -758,41 +960,23 @@ public class LgcMeshUVColorPainter : EditorWindow
         Vector2 local01 = new Vector2(Mathf.Clamp01(local.x / Mathf.Max(1, previewRect.width)), Mathf.Clamp01(local.y / Mathf.Max(1, previewRect.height)));
         Vector2 uv = new Vector2(viewRect.xMin + local01.x * viewRect.width, viewRect.yMax - local01.y * viewRect.height);
 
-        if (e.button == 0)
+        if ((e.button == 0 && mode != PaintMode.Stamp && !IsGradientEditing) || rightErase || (isPainting && e.button == strokeButton))
         {
-            if (mode == PaintMode.Fill || mode == PaintMode.IslandErase)
+            if (!rightErase && (mode == PaintMode.Fill || mode == PaintMode.IslandErase || mode == PaintMode.Erase && eraseMode==1))
             {
-                if (e.type == EventType.MouseDown)
-                {
-                    BeginStrokeSnapshotIfNeeded();
-                    int island = GetIslandIdAtUV_CPU(uv);
-                    if (island >= 0 && islandIdBuffer != null)
-                    {
-                        brushExecutor.FillIsland(island, mode == PaintMode.Fill, brush, uvBoundaryLimitEnabled);
-                    }
-                    else { infoMessage = EditorLanguageManager.Instance.GetText("InfoNoIslandData"); infoType = MessageType.Info; }
-                    if (symmetryEnabled)
-                    {
-                        Vector2 muv = symmetryController.MirrorUV(uv);
-                        if (IsUVInside01(muv))
-                        {
-                            int islandM = GetIslandIdAtUV_CPU(muv);
-                            if (islandM >= 0 && islandIdBuffer != null)
-                                brushExecutor.FillIsland(islandM, mode == PaintMode.Fill, brush, uvBoundaryLimitEnabled);
-                        }
-                    }
-                    EndStrokeApply(); _strokeActive = false;
-                    e.Use(); Repaint();
-                }
+                if(e.type==EventType.MouseDown&&GUIUtility.hotControl==0){ApplyUnifiedFill(uv,mode!=PaintMode.Fill);e.Use();Repaint();}
                 return;
             }
 
-            if (e.type == EventType.MouseDown)
+            if (e.type == EventType.MouseDown && GUIUtility.hotControl == 0)
             {
+                strokeButton = e.button;
+                strokeErase = rightErase || mode == PaintMode.Erase;
+                GUIUtility.hotControl = paintControlId;
                 BeginStrokeSnapshotIfNeeded();
                 isPainting = true; lastUV = uv; _strokeActive = true;
                 activeIslandId = islandIsolationEnabled ? GetIslandIdAtUV_CPU(uv) : -1;
-                brushExecutor.PaintAtUV(uv, mode == PaintMode.Brush, activeIslandId, uvBoundaryLimitEnabled, islandIsolationEnabled, brush);
+                brushExecutor.PaintAtUV(uv, !strokeErase, activeIslandId, uvBoundaryLimitEnabled, islandIsolationEnabled, brush, effectiveRadius);
                 if (symmetryEnabled)
                 {
                     Vector2 muv = symmetryController.MirrorUV(uv);
@@ -801,7 +985,7 @@ public class LgcMeshUVColorPainter : EditorWindow
                         int prev = activeIslandId;
                         int iso = islandIsolationEnabled ? GetIslandIdAtUV_CPU(muv) : -1;
                         activeIslandId = iso;
-                        brushExecutor.PaintAtUV(muv, mode == PaintMode.Brush, activeIslandId, uvBoundaryLimitEnabled, islandIsolationEnabled, brush);
+                        brushExecutor.PaintAtUV(muv, !strokeErase, activeIslandId, uvBoundaryLimitEnabled, islandIsolationEnabled, brush, effectiveRadius);
                         activeIslandId = prev;
                     }
                 }
@@ -810,7 +994,7 @@ public class LgcMeshUVColorPainter : EditorWindow
             }
             else if (e.type == EventType.MouseDrag && isPainting)
             {
-                brushExecutor.DrawStroke(lastUV, uv, mode == PaintMode.Brush, activeIslandId, uvBoundaryLimitEnabled, islandIsolationEnabled, brush);
+                brushExecutor.DrawStroke(lastUV, uv, !strokeErase, activeIslandId, uvBoundaryLimitEnabled, islandIsolationEnabled, brush, effectiveRadius);
                 if (symmetryEnabled)
                 {
                     Vector2 uvA = symmetryController.MirrorUV(lastUV);
@@ -820,7 +1004,7 @@ public class LgcMeshUVColorPainter : EditorWindow
                         int prev = activeIslandId;
                         int iso = islandIsolationEnabled ? GetIslandIdAtUV_CPU(uvB) : -1;
                         activeIslandId = iso;
-                        brushExecutor.DrawStroke(uvA, uvB, mode == PaintMode.Brush, activeIslandId, uvBoundaryLimitEnabled, islandIsolationEnabled, brush);
+                        brushExecutor.DrawStroke(uvA, uvB, !strokeErase, activeIslandId, uvBoundaryLimitEnabled, islandIsolationEnabled, brush, effectiveRadius);
                         activeIslandId = prev;
                     }
                 }
@@ -849,7 +1033,7 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     #region Preview Dirty Management
 
-    private void MarkPreviewDirty() => previewDirty = true;
+    private void MarkPreviewDirty() { paintTransformDirty = true; previewDirty = true; stampPreviewDirty = true; gradientDirty = true; }
 
     private void EnsurePreview()
     {
@@ -1095,6 +1279,8 @@ public class LgcMeshUVColorPainter : EditorWindow
         islandIdBuffer = new ComputeBuffer(count, sizeof(int), ComputeBufferType.Default);
         uvMaskBuffer.SetData(uvMask);
         islandIdBuffer.SetData(islandIdMask);
+        EnsureRegionResources();
+        UploadRegionState();
     }
 
     private void ReleaseMaskBuffers()
@@ -1107,34 +1293,44 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     #region Composite Preview
 
-    private void CompositePreview()
+    private void CompositePreview() => CompositeLayer(paintLayerRT, previewRT);
+
+    private void CompositeLayer(RenderTexture layer, RenderTexture result)
     {
-        if (baseRT == null || paintLayerRT == null || previewRT == null) return;
-        if (baseRT.width != previewRT.width || baseRT.height != previewRT.height) return;
+        if (baseRT == null || layer == null || result == null) return;
+        if (baseRT.width != result.width || baseRT.height != result.height) return;
 
         if (csPaint != null && kComposite >= 0)
         {
             csPaint.SetTexture(kComposite, "_BaseRT", baseRT);
-            csPaint.SetTexture(kComposite, "_PaintLayerRT", paintLayerRT);
-            csPaint.SetTexture(kComposite, "_PreviewRT", previewRT);
-            csPaint.SetInts("_TexSize", previewRT.width, previewRT.height);
+            csPaint.SetTexture(kComposite, "_PaintLayerRT", layer);
+            csPaint.SetTexture(kComposite, "_PreviewRT", result);
+            csPaint.SetInts("_TexSize", result.width, result.height);
             csPaint.Dispatch(kComposite,
-                Mathf.Max(1, (previewRT.width + 15) / 16),
-                Mathf.Max(1, (previewRT.height + 15) / 16),
+                Mathf.Max(1, (result.width + 15) / 16),
+                Mathf.Max(1, (result.height + 15) / 16),
                 1);
         }
         else
         {
             if (baseRT != null)
-                Graphics.Blit(baseRT, previewRT);
+                BlitPreservingTarget(baseRT, result);
             else
-                ClearRT(previewRT, Color.gray);
+                ClearRT(result, Color.gray);
         }
     }
 
     #endregion
 
     #region RT Management
+
+    // v2.9.1: Graphics.Blit leaves its destination active. Never leak it into EditorWindow GUI rendering.
+    private static void BlitPreservingTarget(Texture source, RenderTexture destination)
+    {
+        RenderTexture previous = RenderTexture.active;
+        try { Graphics.Blit(source, destination); }
+        finally { RenderTexture.active = previous; }
+    }
 
     private RenderTexture NewRT(int w, int h)
     {
@@ -1154,9 +1350,12 @@ public class LgcMeshUVColorPainter : EditorWindow
     private void ClearRT(RenderTexture rt, Color c)
     {
         var prev = RenderTexture.active;
-        RenderTexture.active = rt;
-        GL.Clear(true, true, c);
-        RenderTexture.active = prev;
+        try
+        {
+            RenderTexture.active = rt;
+            GL.Clear(true, true, c);
+        }
+        finally { RenderTexture.active = prev; }
     }
 
     private void RecreatePreviewRT()
@@ -1173,34 +1372,82 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     #region Material / Texture Management
 
-    private void ApplyMaterialInstanceWithTexture(Texture tex)
+    // v2.9.1: preview objects are owned by this window, never by Unity's global Undo.
+    private void SetRealtimePreview(bool enabled)
     {
-        if (targetRenderer == null || originalMaterialAsset == null) return;
-        var mats = targetRenderer.sharedMaterials;
-        if (mats == null || mats.Length == 0 || selectedMatIndex < 0 || selectedMatIndex >= mats.Length) return;
+        FinishActiveStroke();
+        enableRealTimePreview = enabled;
+        if (enabled && paintLayerRT != null)
+        {
+            EnsurePreview();
+            ApplyMaterialInstanceWithTexture(GetDisplayPreview());
+        }
+        else ForceRestorePreviewMaterial();
+        infoMessage = EditorLanguageManager.Instance.GetText(enabled ? "RealtimeOn" : "RealtimeOff");
+        infoType = MessageType.Info;
+        Repaint();
+    }
 
-        Material currentMat = mats[selectedMatIndex];
-        Material instanceMat;
-        if (currentMat != null && !EditorUtility.IsPersistent(currentMat) && currentMat.shader == originalMaterialAsset.shader)
-        {
-            instanceMat = currentMat;
-        }
-        else
-        {
-            instanceMat = new Material(originalMaterialAsset);
-            Undo.RegisterCreatedObjectUndo(instanceMat, "Create Material Instance");
-            mats[selectedMatIndex] = instanceMat;
-            targetRenderer.sharedMaterials = mats;
-        }
-        AssignTextureToAllLikelyMainProps(instanceMat, tex);
-#if UNITY_2021_3_OR_NEWER
-        PrefabUtility.RecordPrefabInstancePropertyModifications(targetRenderer);
-#endif
-        AssetDatabase.SaveAssets();
+    private void OnUnityUndoRedo()
+    {
+        if (!enableRealTimePreview || previewRepairPending) return;
+        previewRepairPending = true;
+        EditorApplication.delayCall += RepairPreviewAfterUndo;
+    }
+
+    private void RepairPreviewAfterUndo()
+    {
+        previewRepairPending = false;
+        if (this == null || !enableRealTimePreview || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        if (targetRenderer == null || originalMaterialAsset == null || paintLayerRT == null) return;
+        EnsurePreview();
+        ApplyMaterialInstanceWithTexture(GetDisplayPreview());
         SceneView.RepaintAll();
         Repaint();
-        sourceMaterial = instanceMat;
+    }
+
+    private void OnSceneSaving(Scene scene, string path)
+    {
+        if (previewRenderer == null || previewRenderer.gameObject.scene != scene) return;
+        ForceRestorePreviewMaterial();
+        OnUnityUndoRedo();
+    }
+
+    private void OnPlayModeStateChanged(PlayModeStateChange state)
+    {
+        if (state == PlayModeStateChange.ExitingEditMode) RestoreOriginalMaterial();
+        else if (state == PlayModeStateChange.EnteredEditMode && enableRealTimePreview) OnUnityUndoRedo();
+    }
+
+    private void ApplyMaterialInstanceWithTexture(Texture tex)
+    {
+        if (targetRenderer == null || originalMaterialAsset == null || tex == null || EditorApplication.isPlayingOrWillChangePlaymode) return;
+        if (previewMaterialSlotIndex >= 0 && (previewRenderer != targetRenderer || previewMaterialSlotIndex != selectedMatIndex))
+            ForceRestorePreviewMaterial();
+        var mats = targetRenderer.sharedMaterials;
+        if (selectedMatIndex < 0 || selectedMatIndex >= mats.Length) return;
+        if (previewMaterial == null)
+        {
+            previewMaterial = new Material(originalMaterialAsset)
+            {
+                name = originalMaterialAsset.name + " (LGC Preview)",
+                hideFlags = HideFlags.HideAndDontSave
+            };
+        }
+        bool changed = mats[selectedMatIndex] != previewMaterial;
+        if (changed)
+        {
+            mats[selectedMatIndex] = previewMaterial;
+            targetRenderer.sharedMaterials = mats;
+        }
+        bool textureChanged = previewMaterial.mainTexture != tex;
+        if (changed || textureChanged)
+            AssignTextureToAllLikelyMainProps(previewMaterial, tex);
+        previewRenderer = targetRenderer;
+        previewOriginalMaterial = originalMaterialAsset;
         previewMaterialSlotIndex = selectedMatIndex;
+        sourceMaterial = previewMaterial;
+        if (changed || textureChanged) SceneView.RepaintAll();
     }
 
     private string FindMainTexturePropertyName(Material mat)
@@ -1238,52 +1485,37 @@ public class LgcMeshUVColorPainter : EditorWindow
         if (mat == null || tex == null) return;
         if (string.IsNullOrEmpty(mainTexPropName)) mainTexPropName = FindMainTexturePropertyName(mat);
         if (!string.IsNullOrEmpty(mainTexPropName) && mat.HasProperty(mainTexPropName))
-        { Undo.RecordObject(mat, "Assign MainTex (Primary)"); mat.SetTexture(mainTexPropName, tex); }
+            mat.SetTexture(mainTexPropName, tex);
         string[] candidates = { "_BaseMap", "_MainTex", "_BaseColorMap", "_BaseColorTexture", "_Albedo", "_AlbedoMap", "MainTex" };
-        foreach (var n in candidates) { if (mat.HasProperty(n)) { Undo.RecordObject(mat, $"Assign {n}"); mat.SetTexture(n, tex); } }
-        Undo.RecordObject(mat, "Assign mainTexture"); mat.mainTexture = tex;
-        EditorUtility.SetDirty(mat);
+        foreach (var name in candidates)
+            if (mat.HasProperty(name)) mat.SetTexture(name, tex);
+        mat.mainTexture = tex;
     }
 
     private void RestoreOriginalMaterial()
     {
-        if (targetRenderer == null || originalMaterialAsset == null) return;
-        var mats = targetRenderer.sharedMaterials;
-        if (mats == null || mats.Length == 0 || selectedMatIndex < 0 || selectedMatIndex >= mats.Length) return;
-        if (mats[selectedMatIndex] == originalMaterialAsset) return;
-
-        mats[selectedMatIndex] = originalMaterialAsset;
-        targetRenderer.sharedMaterials = mats;
-#if UNITY_2021_3_OR_NEWER
-        PrefabUtility.RecordPrefabInstancePropertyModifications(targetRenderer);
-#endif
-        AssetDatabase.SaveAssets();
-        SceneView.RepaintAll();
-        Repaint();
-        sourceMaterial = originalMaterialAsset;
+        ForceRestorePreviewMaterial();
     }
 
     private void ForceRestorePreviewMaterial()
     {
-        if (targetRenderer == null) return;
-        if (originalMaterialAsset == null) return;
-        if (previewMaterialSlotIndex < 0) return;
-
-        var mats = targetRenderer.sharedMaterials;
-        if (mats == null) return;
-        if (previewMaterialSlotIndex >= mats.Length) return;
-
-        if (mats[previewMaterialSlotIndex] != originalMaterialAsset)
+        if (previewRenderer != null && previewMaterialSlotIndex >= 0)
         {
-            mats[previewMaterialSlotIndex] = originalMaterialAsset;
-            targetRenderer.sharedMaterials = mats;
-#if UNITY_2021_3_OR_NEWER
-            PrefabUtility.RecordPrefabInstancePropertyModifications(targetRenderer);
-#endif
+            var mats = previewRenderer.sharedMaterials;
+            if (previewMaterialSlotIndex < mats.Length &&
+                (mats[previewMaterialSlotIndex] == previewMaterial || mats[previewMaterialSlotIndex] == null))
+            {
+                mats[previewMaterialSlotIndex] = previewOriginalMaterial;
+                previewRenderer.sharedMaterials = mats;
+            }
         }
-
+        if (previewMaterial != null) Object.DestroyImmediate(previewMaterial);
+        previewMaterial = null;
+        previewRenderer = null;
+        previewOriginalMaterial = null;
         previewMaterialSlotIndex = -1;
-        sourceMaterial = null;
+        sourceMaterial = originalMaterialAsset;
+        SceneView.RepaintAll();
     }
 
     #endregion
@@ -1300,6 +1532,7 @@ public class LgcMeshUVColorPainter : EditorWindow
         EnsurePreview();
         WriteRTToPng_ColorCorrect(previewRT, outputAssetPath);
         AssetDatabase.ImportAsset(outputAssetPath, ImportAssetOptions.ForceUpdate);
+        ConfigureExportImporter(outputAssetPath);
         AssetDatabase.SaveAssets(); AssetDatabase.Refresh();
 
         appliedToOutput = true;
@@ -1360,6 +1593,8 @@ public class LgcMeshUVColorPainter : EditorWindow
         var importer = AssetImporter.GetAtPath(layerPath) as TextureImporter;
         if (importer != null)
         {
+            importer.maxTextureSize = GetExportImportSize();
+            importer.npotScale = TextureImporterNPOTScale.None;
             importer.textureType = TextureImporterType.Default;
             importer.alphaSource = TextureImporterAlphaSource.FromInput;
             importer.alphaIsTransparency = true;
@@ -1452,6 +1687,9 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     private void ClearCurrentEdits()
     {
+        FinishActiveStroke();
+        SuppressStampPreview();
+        EnsureRegionResources();
         var L = EditorLanguageManager.Instance;
         if (paintLayerRT == null || baseRT == null) { infoMessage = L.GetText("InfoNoMesh"); infoType = MessageType.Warning; return; }
         BeginStrokeSnapshot();
@@ -1477,10 +1715,10 @@ public class LgcMeshUVColorPainter : EditorWindow
     {
         if (paintLayerRT == null) return;
         RenderTexture snap = GetSnapshotTarget();
-        Graphics.Blit(paintLayerRT, snap);
+        BlitPreservingTarget(paintLayerRT, snap);
 
         undoList.Add(snap);
-        while (undoList.Count > UNDO_LIMIT)
+        while (undoList.Count > HistoryLimit)
         {
             var old = undoList[0];
             undoList.RemoveAt(0);
@@ -1492,6 +1730,7 @@ public class LgcMeshUVColorPainter : EditorWindow
             var old = redoStack.Pop();
             if (old != null) rtPool.Return(old);
         }
+        TrimHistoryBudget();
     }
 
     private void EndStrokeApply()
@@ -1500,7 +1739,7 @@ public class LgcMeshUVColorPainter : EditorWindow
         EnsurePreview();
         if (enableRealTimePreview && paintLayerRT != null)
         {
-            ApplyMaterialInstanceWithTexture(previewRT);
+            ApplyMaterialInstanceWithTexture(GetDisplayPreview());
         }
         SceneView.RepaintAll();
         Repaint();
@@ -1508,6 +1747,9 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     private void DoUndo_Internal()
     {
+        FinishActiveStroke();
+        SuppressStampPreview();
+        if (paintLayerRT == null || rtPool == null) return;
         var L = EditorLanguageManager.Instance;
         if (undoList.Count == 0)
         {
@@ -1520,10 +1762,12 @@ public class LgcMeshUVColorPainter : EditorWindow
         undoList.RemoveAt(undoList.Count - 1);
 
         RenderTexture curr = GetSnapshotTarget();
-        Graphics.Blit(paintLayerRT, curr);
+        BlitPreservingTarget(paintLayerRT, curr);
         redoStack.Push(curr);
-        Graphics.Blit(prev, paintLayerRT);
+        if (prev.width == paintLayerRT.width && prev.height == paintLayerRT.height) BlitPreservingTarget(prev, paintLayerRT);
+        else ResizePaintTexture(prev, paintLayerRT);
         rtPool.Return(prev);
+        TrimHistoryBudget();
 
         MarkPreviewDirty();
         EndStrokeApply();
@@ -1533,6 +1777,9 @@ public class LgcMeshUVColorPainter : EditorWindow
 
     private void DoRedo_Internal()
     {
+        FinishActiveStroke();
+        SuppressStampPreview();
+        if (paintLayerRT == null || rtPool == null) return;
         var L = EditorLanguageManager.Instance;
         if (redoStack.Count == 0)
         {
@@ -1542,10 +1789,17 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
         RenderTexture next = redoStack.Pop();
         RenderTexture curr = GetSnapshotTarget();
-        Graphics.Blit(paintLayerRT, curr);
+        BlitPreservingTarget(paintLayerRT, curr);
         undoList.Add(curr);
-        Graphics.Blit(next, paintLayerRT);
+        while (undoList.Count > HistoryLimit)
+        {
+            rtPool.Return(undoList[0]);
+            undoList.RemoveAt(0);
+        }
+        if (next.width == paintLayerRT.width && next.height == paintLayerRT.height) BlitPreservingTarget(next, paintLayerRT);
+        else ResizePaintTexture(next, paintLayerRT);
         rtPool.Return(next);
+        TrimHistoryBudget();
 
         MarkPreviewDirty();
         EndStrokeApply();
@@ -1563,10 +1817,29 @@ public class LgcMeshUVColorPainter : EditorWindow
         if (stampExecutor == null) return;
         if (paintLayerRT == null) return;
 
+        if (symmetryEnabled && !symmetryLocked)
+        {
+            infoMessage = EditorLanguageManager.Instance.GetText("SymmetrySetupHint");
+            infoType = MessageType.Info;
+            Repaint();
+            return;
+        }
+        FinishActiveStroke();
         BeginStrokeSnapshot();
 
+        StampToLayer(stampExecutor);
+        SuppressStampPreview();
+
+        EndStrokeApply();
+        infoMessage = EditorLanguageManager.Instance.GetText("StampApplied");
+        infoType = MessageType.Info;
+    }
+
+    private void StampToLayer(LgcStampExecutor executor)
+    {
+        EnsureRegionResources();
         // 主图案（不镜像）
-        stampExecutor.ApplyStamp(
+        executor.ApplyStamp(
             stampSettings.StampTexture,
             stampSettings.UV,
             stampSettings.Scale,
@@ -1575,15 +1848,16 @@ public class LgcMeshUVColorPainter : EditorWindow
             uvBoundaryLimitEnabled,
             islandIsolationEnabled,
             activeIslandId,
-            false  // 主图案不翻转
+            false, stampSettings.OverlayColor, stampSettings.ColorStrength  // 主图案不翻转
         );
 
         // ★ 对称图案（根据设置决定是否翻转）
-        if (stampSettings.EnableSymmetry && symmetryEnabled && symmetryController != null)
+        if (symmetryEnabled && symmetryController != null)
         {
             Vector2 mirroredUV = symmetryController.MirrorUV(stampSettings.UV);
-            float mirroredRotation = -stampSettings.Rotation;
-            stampExecutor.ApplyStamp(
+            Vector2 axis = symmetryController.SymB - symmetryController.SymA;
+            float mirroredRotation = 2f * Mathf.Atan2(axis.y, axis.x) * Mathf.Rad2Deg - stampSettings.Rotation - 180f;
+            executor.ApplyStamp(
                 stampSettings.StampTexture,
                 mirroredUV,
                 stampSettings.Scale,
@@ -1592,13 +1866,68 @@ public class LgcMeshUVColorPainter : EditorWindow
                 uvBoundaryLimitEnabled,
                 islandIsolationEnabled,
                 activeIslandId,
-                stampSettings.MirrorPattern  // ★ 传入镜像标志
+                stampSettings.MirrorPattern, stampSettings.OverlayColor, stampSettings.ColorStrength
             );
         }
 
-        EndStrokeApply();
-        infoMessage = "盖印已应用 (可 Ctrl+Z 撤销)";
-        infoType = MessageType.Info;
+    }
+
+    private void SuppressStampPreview()
+    {
+        CancelPaintTransform();
+        gradientPending = false;
+        suppressedStampPreview = stampSettings?.Clone();
+        suppressedStampSymA = symmetryEnabled ? symmetryController.SymA : Vector2.zero;
+        suppressedStampSymB = symmetryEnabled ? symmetryController.SymB : Vector2.zero;
+        stampPreviewDirty = true;
+    }
+
+    private static bool SameStamp(LgcStampSettings a, LgcStampSettings b)
+    {
+        return a != null && b != null && a.StampTexture == b.StampTexture && a.UV == b.UV &&
+            a.Rotation == b.Rotation && a.Scale == b.Scale && a.Opacity == b.Opacity &&
+            a.OverlayColor == b.OverlayColor && a.ColorStrength == b.ColorStrength &&
+            a.ShowPreview == b.ShowPreview && a.MirrorPattern == b.MirrorPattern;
+    }
+
+    // v2.9.1: Scratch preview never mutates paintLayerRT, export data, or Undo history.
+    private RenderTexture GetDisplayPreview() => GetDisplayPreviewForGUI(true);
+
+    private RenderTexture GetDisplayPreviewForGUI(bool refresh)
+    {
+        if (activeToolTab == 3 && mode == PaintMode.Selection && paintTransformPending) return GetPaintTransformDisplay(refresh);
+        if (IsGradientEditing) return GetGradientDisplay(refresh);
+        if (refresh) EnsurePreview();
+        if (paintLayerRT == null || !computeReady || stampExecutor == null || activeToolTab != 1 || mode != PaintMode.Stamp ||
+            stampSettings?.StampTexture == null || !stampSettings.ShowPreview || (symmetryEnabled && !symmetryLocked)) return previewRT;
+
+        Vector2 symA = symmetryEnabled ? symmetryController.SymA : Vector2.zero;
+        Vector2 symB = symmetryEnabled ? symmetryController.SymB : Vector2.zero;
+        if (suppressedStampPreview != null)
+        {
+            if (SameStamp(stampSettings, suppressedStampPreview) && symA == suppressedStampSymA && symB == suppressedStampSymB) return previewRT;
+            suppressedStampPreview = null;
+        }
+        if (!refresh) return stampPreviewRT != null && cachedStampPreview != null ? stampPreviewRT : previewRT;
+        if (stampPreviewLayerRT == null || stampPreviewLayerRT.width != paintLayerRT.width || stampPreviewLayerRT.height != paintLayerRT.height)
+        {
+            if (stampPreviewLayerRT != null) SafeReleaseRT(stampPreviewLayerRT);
+            if (stampPreviewRT != null) SafeReleaseRT(stampPreviewRT);
+            stampPreviewLayerRT = NewRT(paintLayerRT.width, paintLayerRT.height);
+            stampPreviewRT = NewRT(paintLayerRT.width, paintLayerRT.height);
+            stampPreviewDirty = true;
+        }
+        if (stampPreviewDirty || !SameStamp(stampSettings, cachedStampPreview) || symA != cachedStampSymA || symB != cachedStampSymB)
+        {
+            BlitPreservingTarget(paintLayerRT, stampPreviewLayerRT);
+            StampToLayer(new LgcStampExecutor(csPaint, kStamp, stampPreviewLayerRT, uvMaskBuffer, islandIdBuffer));
+            CompositeLayer(stampPreviewLayerRT, stampPreviewRT);
+            cachedStampPreview = stampSettings.Clone();
+            cachedStampSymA = symA; cachedStampSymB = symB;
+            stampPreviewDirty = false;
+            if (enableRealTimePreview) SceneView.RepaintAll();
+        }
+        return stampPreviewRT;
     }
 
     #endregion
@@ -1614,7 +1943,7 @@ public class LgcMeshUVColorPainter : EditorWindow
 
         if (sourceTex != null)
         {
-            Graphics.Blit(sourceTex, baseRT);
+            BlitPreservingTarget(sourceTex, baseRT);
         }
         else
         {
@@ -1635,8 +1964,32 @@ public class LgcMeshUVColorPainter : EditorWindow
         }
     }
 
+    private void OnLostFocus()
+    {
+        FinishActiveStroke();
+        CancelRegionInteraction();
+        viewController?.CancelNavigation();
+        stampController?.CancelInteraction();
+        Repaint();
+    }
+
     private void ReleaseGPUResources()
     {
+        if (paintControlId != 0 && GUIUtility.hotControl == paintControlId) GUIUtility.hotControl = 0;
+        CancelRegionInteraction();
+        ReleaseRegionResources();
+        viewController?.CancelNavigation();
+        stampController?.CancelInteraction();
+        ForceRestorePreviewMaterial();
+        _strokeActive = false;
+        isPainting = false;
+        lastUV = new Vector2(-1, -1);
+        activeIslandId = -1;
+        brushExecutor = null;
+        if (stampPreviewLayerRT != null) SafeReleaseRT(stampPreviewLayerRT);
+        if (stampPreviewRT != null) SafeReleaseRT(stampPreviewRT);
+        stampPreviewLayerRT = null; stampPreviewRT = null;
+        cachedStampPreview = null; suppressedStampPreview = null; stampPreviewDirty = true;
         ReleaseMaskBuffers();
         if (paintLayerRT != null)
         {
@@ -1716,6 +2069,7 @@ public class LgcMeshUVColorPainter : EditorWindow
                 kc = c.FindKernel("KComposite");
                 kcw = c.FindKernel("KCompositeWhite");
                 ks = c.FindKernel("KStamp");
+                c.FindKernel("KGradient"); c.FindKernel("KRegionOverlay"); c.FindKernel("KPaintTransform"); c.FindKernel("KPaintSelectionOverlay"); c.FindKernel("KFillRegion");
             }
             catch { }
             if (kb >= 0 && kf >= 0 && kc >= 0 && kcw >= 0 && ks >= 0)
@@ -1733,6 +2087,13 @@ public class LgcMeshUVColorPainter : EditorWindow
             kComposite = csPaint.FindKernel("KComposite");
             kCompositeWhite = csPaint.FindKernel("KCompositeWhite");
             kStamp = csPaint.FindKernel("KStamp");
+            kMirrorLayer = csPaint.FindKernel("KMirrorLayer");
+            kResizeExport = csPaint.FindKernel("KResizeExport");
+            kGradient = csPaint.FindKernel("KGradient");
+            kRegionOverlay = csPaint.FindKernel("KRegionOverlay");
+            kPaintTransform = csPaint.FindKernel("KPaintTransform");
+            kPaintSelectionOverlay = csPaint.FindKernel("KPaintSelectionOverlay");
+            kFillRegion = csPaint.FindKernel("KFillRegion");
             computeReady = (kBrush >= 0 && kFillIsland >= 0 && kComposite >= 0 && kCompositeWhite >= 0 && kStamp >= 0);
         }
         else computeReady = false;
@@ -1872,6 +2233,7 @@ public class LgcMeshUVColorPainter : EditorWindow
 
         MarkPreviewDirty();
         EnsurePreview();
+        if (enableRealTimePreview) ApplyMaterialInstanceWithTexture(GetDisplayPreview());
         Repaint();
     }
 
@@ -1978,10 +2340,13 @@ public class LgcMeshUVColorPainter : EditorWindow
     {
         var prev = RenderTexture.active;
         Texture2D texLinear = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false, true);
-        RenderTexture.active = rt;
-        texLinear.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
-        texLinear.Apply(false, false);
-        RenderTexture.active = prev;
+        try
+        {
+            RenderTexture.active = rt;
+            texLinear.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+            texLinear.Apply(false, false);
+        }
+        finally { RenderTexture.active = prev; }
         return texLinear;
     }
 
@@ -2006,20 +2371,59 @@ public class LgcMeshUVColorPainter : EditorWindow
         return srgbTex;
     }
 
+    private Vector2Int GetExportDimensions()
+    {
+        int w = paintLayerRT != null ? paintLayerRT.width : 1, h = paintLayerRT != null ? paintLayerRT.height : 1;
+        int[] sizes = { 0, 1024, 2048, 4096 };
+        int edge = sizes[Mathf.Clamp(exportResolutionIndex, 0, sizes.Length - 1)];
+        if (edge == 0) return originalTexture != null ? new Vector2Int(originalTexture.width, originalTexture.height) : new Vector2Int(w, h);
+        float scale = (float)edge / Mathf.Max(w, h);
+        return new Vector2Int(Mathf.Max(1, Mathf.RoundToInt(w * scale)), Mathf.Max(1, Mathf.RoundToInt(h * scale)));
+    }
+
+    private int GetExportImportSize()
+    {
+        Vector2Int size = GetExportDimensions();
+        return Mathf.Clamp(Mathf.NextPowerOfTwo(Mathf.Max(size.x, size.y)), 32, SystemInfo.maxTextureSize);
+    }
+
+    private void ConfigureExportImporter(string assetPath)
+    {
+        var importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+        if (importer == null) return;
+        importer.maxTextureSize = GetExportImportSize();
+        importer.npotScale = TextureImporterNPOTScale.None;
+        importer.SaveAndReimport();
+    }
+
     private void WriteRTToPng_ColorCorrect(RenderTexture rt, string assetPath)
     {
         if (rt == null || string.IsNullOrEmpty(assetPath)) return;
         string dir = Path.GetDirectoryName(assetPath).Replace('\\', '/');
         if (!AssetDatabase.IsValidFolder(dir)) CreateFoldersRecursively(dir);
-
-        Texture2D texLinear = ReadRT_Linear(rt);
-        Texture2D texSRGB = ToSRGBIfNeeded(texLinear);
-
-        string assetsFull = Application.dataPath;
-        string sub = assetPath.Substring("Assets".Length).TrimStart('/', '\\');
-        string fullPath = Path.Combine(assetsFull, sub);
-        File.WriteAllBytes(fullPath, texSRGB.EncodeToPNG());
-        Object.DestroyImmediate(texSRGB);
+        RenderTexture resized = null;
+        Texture2D pixels = null;
+        try
+        {
+            Vector2Int size = GetExportDimensions();
+            if (size.x != rt.width || size.y != rt.height)
+            {
+                resized = NewRT(size.x, size.y);
+                csPaint.SetTexture(kResizeExport, "_ExportSource", rt);
+                csPaint.SetTexture(kResizeExport, "_ResultRT", resized);
+                csPaint.SetInts("_TexSize", rt.width, rt.height);
+                csPaint.SetInts("_ExportSize", size.x, size.y);
+                csPaint.Dispatch(kResizeExport, (size.x + 15) / 16, (size.y + 15) / 16, 1);
+            }
+            pixels = ToSRGBIfNeeded(ReadRT_Linear(resized != null ? resized : rt));
+            string sub = assetPath.Substring("Assets".Length).TrimStart('/', '\\');
+            File.WriteAllBytes(Path.Combine(Application.dataPath, sub), pixels.EncodeToPNG());
+        }
+        finally
+        {
+            if (pixels != null) Object.DestroyImmediate(pixels);
+            SafeReleaseRT(resized);
+        }
     }
 
     #endregion

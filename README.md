@@ -1,6 +1,6 @@
 # LGC网格UV绘画工具
 
-当前版本：`v2.7.0`
+当前版本：`v3.0 beta`
 
 LGC网格UV绘画工具是面向 Unity 2022.3 和 VRChat 项目维护流程的编辑器工具。它基于 Mesh UV 快速绘制颜色，支持材质槽隔离、UV 孤岛编辑、图案盖印、对称绘制和多语言界面。
 
@@ -8,14 +8,18 @@ LGC网格UV绘画工具是面向 Unity 2022.3 和 VRChat 项目维护流程的�
 
 完整修改日志：[CHANGELOG](Packages/com.lgcchina.mesh-uv-painter/CHANGELOG.md)
 
+## v3.0 beta
+
+当前发布包版本为 `3.0.0-beta.1`，GitHub 标记为预发布。VCC/ALCOM 中如未显示此版本，请启用预发布包，或使用 Release ZIP 手动安装。完整功能、安装方式与注意事项见[包内 README](Packages/com.lgcchina.mesh-uv-painter/README.md)和[修改日志](Packages/com.lgcchina.mesh-uv-painter/CHANGELOG.md)。
+
 ## 核心特性
-- UV 颜色绘制：支持画笔、橡皮擦、UV 孤岛填充和孤岛橡皮擦；
-- 材质 UV 隔离：按 Renderer 材质槽和 Mesh 子网格确定当前 UV 范围；
-- 3 RenderTexture 架构：原图、绘画层和预览层分离；
-- 图案盖印：支持盖印、盖印对称和镜像不透明度调整；
-- 多语言切换：内置中、日、英三种语言；
-- 资源目录定位：一键跳转 Project 面板输出目录；
-- 轻量化：纯编辑器工具，无运行时代码。
+
+- 按功能 Tab 分区，绘制支持画笔、常规/孤岛/渐变擦除和统一填充。
+- 实时预览盖印与多色标渐变，框选内容可移动、旋转、缩放。
+- 按材质组隔离 UV，支持孤岛选择、三角面框选、隐藏和编辑保护。
+- 统一对称绘制/盖印、镜像已有内容，支持撤回与重做。
+- 可调绘制清晰度和输出分辨率、固定/同步缩放画笔及右键操作。
+- 原图、绘画层和预览层分离，纯编辑器工具，支持中/日/英。
 
 ## 安装方法 VCC/ALCOM
 ### 方式1：VRChat Creator Companion（VCC）/ALCOM
@@ -48,6 +52,13 @@ https://lgcchina.github.io/LGC-VRC-Packages/
 6. 切换材质槽或刷新材质后，应重新确认“UV显示范围”是否符合预期。
 
 ## 版本日志
+
+### v3.0 beta（3.0.0-beta.1）
+
+- 发布本轮绘制、盖印、框选渐变、UV 选择管理和界面更新。
+- 作为 GitHub 预发布提供，VCC/ALCOM 可能需要启用预发布显示。
+- 完整功能与安装注意事项见包内 README 和 CHANGELOG。
+
 
 ### v2.7.0
 - 新增按材质组隔离 UV，默认只显示当前材质槽对应的 Mesh 子网格 UV；

@@ -1,25 +1,18 @@
 #if UNITY_EDITOR
+// LgcBrushSettings.cs (v2.8.0) - User radius and size mode; effective texture radius is computed by the window.
 using System;
 using UnityEngine;
 
-/// <summary>
-/// LGC - 画笔参数数据
-/// 仅保存“画笔长什么样”的信息，不负责绘制、不负责事件、不负责 GPU
-/// </summary>
+internal enum LgcBrushSizeMode { Screen, Texture }
+
 [Serializable]
 internal class LgcBrushSettings
 {
-    [Header("Brush")]
     public Color Color = Color.yellow;
-
-    [Range(1, 256)]
-    public int Size = 32;
-
-    [Range(0f, 1f)]
-    public float Opacity = 1.0f;
-
-    [Range(0f, 1f)]
-    public float Hardness = 1.0f;
+    [Range(1, 256)] public int Size = 32;
+    public LgcBrushSizeMode SizeMode = LgcBrushSizeMode.Screen;
+    [Range(0f, 1f)] public float Opacity = 1f;
+    [Range(0f, 1f)] public float Hardness = 1f;
 
     public void Clamp()
     {
@@ -30,13 +23,7 @@ internal class LgcBrushSettings
 
     public LgcBrushSettings Clone()
     {
-        return new LgcBrushSettings
-        {
-            Color = this.Color,
-            Size = this.Size,
-            Opacity = this.Opacity,
-            Hardness = this.Hardness
-        };
+        return new LgcBrushSettings { Color = Color, Size = Size, SizeMode = SizeMode, Opacity = Opacity, Hardness = Hardness };
     }
 }
 #endif

@@ -1,9 +1,10 @@
 #if UNITY_EDITOR
+// v2.9.0: Shared GPU stamp color settings for preview and commit.
 using UnityEngine;
 
 /// <summary>
-/// LGC - ¸ÇÓ¡Í¼°¸Ö´ĞĞÆ÷ (v2.7.0)
-/// Ö§³Ö UV ±ß½çÏŞÖÆ¡¢¹Âµº¸ôÀë¡¢Í¼°¸¾µÏñ
+/// LGC - ç›–å°å›¾æ¡ˆæ‰§è¡Œå™¨ (v2.9.0)
+/// æ”¯æŒ UV è¾¹ç•Œé™åˆ¶ã€å­¤å²›éš”ç¦»ã€å›¾æ¡ˆé•œåƒ
 /// </summary>
 internal class LgcStampExecutor
 {
@@ -37,7 +38,7 @@ internal class LgcStampExecutor
         bool enableBoundary = false,
         bool enableIsolation = false,
         int activeIslandId = -1,
-        bool mirrorPattern = false)  // ¡ï ĞÂÔö²ÎÊı
+        bool mirrorPattern = false, Color? overlayColor = null, float colorStrength = 0f)  // â˜… æ–°å¢å‚æ•°
     {
         if (stampTex == null || paintLayerRT == null || shader == null || kStamp < 0) return;
 
@@ -92,8 +93,10 @@ internal class LgcStampExecutor
         shader.SetFloat("_StampScale", scale);
         shader.SetFloat("_StampRotation", rotation * Mathf.Deg2Rad);
         shader.SetFloat("_StampOpacity", Mathf.Clamp01(opacity));
+        shader.SetVector("_StampOverlayColor", overlayColor ?? Color.white);
+        shader.SetFloat("_StampColorStrength", Mathf.Clamp01(colorStrength));
         shader.SetFloats("_StampTexSize", stampTex.width, stampTex.height);
-        shader.SetFloat("_StampMirror", mirrorPattern ? 1f : 0f);  // ¡ï ´«µİ¸ø Compute
+        shader.SetFloat("_StampMirror", mirrorPattern ? 1f : 0f);  // â˜… ä¼ é€’ç»™ Compute
 
         shader.SetInt("_EnableBoundary", enableBoundary ? 1 : 0);
         shader.SetInt("_EnableIsolation", enableIsolation ? 1 : 0);
